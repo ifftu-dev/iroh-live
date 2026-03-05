@@ -1,12 +1,11 @@
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
+pub use nokhwa::utils::CameraIndex;
 use nokhwa::{
     nokhwa_initialize,
     pixel_format::RgbFormat,
-    utils::{
-        CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType, Resolution,
-    },
+    utils::{CameraFormat, FrameFormat, RequestedFormat, RequestedFormatType, Resolution},
 };
 use tracing::{debug, info, trace, warn};
 use xcap::{Monitor, VideoRecorder};
@@ -118,7 +117,16 @@ pub struct CameraCapturer {
 }
 
 impl CameraCapturer {
+    /// Create a camera capturer using the default camera (or `IROH_LIVE_CAMERA` env var).
     pub fn new() -> Result<Self> {
+        Self::with_index(None)
+    }
+
+    /// Create a camera capturer targeting a specific camera by index.
+    ///
+    /// If `index` is `None`, falls back to the `IROH_LIVE_CAMERA` env var,
+    /// then to the last camera reported by nokhwa (typically the primary one).
+    pub fn with_index(index: Option<CameraIndex>) -> Result<Self> {
         info!("Initializing camera capturer (nokhwa)");
         nokhwa_initialize(|granted| {
             debug!("User selected camera access: {}", granted);
@@ -130,16 +138,19 @@ impl CameraCapturer {
         }
         info!("Available cameras: {cameras:?}");
 
-        let camera_index = match std::env::var("IROH_LIVE_CAMERA").ok() {
-            None => {
-                // Order of cameras in nokhwa is reversed from usual order (primary camera is last).
-                let first_camera = cameras.last().unwrap();
-                info!(": {}", first_camera.human_name());
-                first_camera.index().clone()
-            }
-            Some(camera_name) => match u32::from_str(&camera_name).ok() {
-                Some(num) => CameraIndex::Index(num),
-                None => CameraIndex::String(camera_name),
+        let camera_index = match index {
+            Some(idx) => idx,
+            None => match std::env::var("IROH_LIVE_CAMERA").ok() {
+                None => {
+                    // Order of cameras in nokhwa is reversed from usual order (primary camera is last).
+                    let first_camera = cameras.last().unwrap();
+                    info!(": {}", first_camera.human_name());
+                    first_camera.index().clone()
+                }
+                Some(camera_name) => match u32::from_str(&camera_name).ok() {
+                    Some(num) => CameraIndex::Index(num),
+                    None => CameraIndex::String(camera_name),
+                },
             },
         };
         let mut camera = nokhwa::Camera::new(
@@ -164,6 +175,18 @@ impl CameraCapturer {
             width: resolution.width(),
             height: resolution.height(),
         })
+    }
+
+    /// List available cameras. Returns a vec of (index, human_name) pairs.
+    pub fn list_cameras() -> Result<Vec<(CameraIndex, String)>> {
+        nokhwa_initialize(|granted| {
+            debug!("User selected camera access: {}", granted);
+        });
+        let cameras = nokhwa::query(nokhwa::utils::ApiBackend::Auto)?;
+        Ok(cameras
+            .into_iter()
+            .map(|c| (c.index().clone(), c.human_name().to_string()))
+            .collect())
     }
 
     fn select_format(

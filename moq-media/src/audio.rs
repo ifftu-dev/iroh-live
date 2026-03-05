@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result};
 use firewheel::{
     FirewheelConfig, FirewheelContext,
-    cpal::{CpalConfig, CpalInputConfig, CpalOutputConfig},
+    cpal::{CpalConfig, CpalEnumerator, CpalInputConfig, CpalOutputConfig},
     channel_config::{ChannelConfig, ChannelCount, NonZeroChannelCount},
     dsp::volume::{DEFAULT_DB_EPSILON, DbMeterNormalizer},
     graph::PortIdx,
@@ -24,6 +24,8 @@ use firewheel::{
         },
     },
 };
+pub use firewheel::cpal::DeviceInfo;
+pub use firewheel::cpal::cpal::DeviceId;
 use tokio::sync::{mpsc, mpsc::error::TryRecvError, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
@@ -45,9 +47,33 @@ pub struct AudioBackend {
 
 impl AudioBackend {
     pub fn new() -> Self {
+        Self::new_with_devices(None, None)
+    }
+
+    /// Create an AudioBackend with specific input/output device IDs.
+    ///
+    /// Pass `None` for either to use the system default.
+    /// Note: changing devices requires creating a new AudioBackend
+    /// (the entire FirewheelContext is tied to one input + one output device).
+    pub fn new_with_devices(
+        input_device_id: Option<DeviceId>,
+        output_device_id: Option<DeviceId>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(32);
-        let _handle = spawn_thread("audiodriver", move || AudioDriver::new(rx).run());
+        let _handle = spawn_thread("audiodriver", move || {
+            AudioDriver::new_with_devices(rx, input_device_id, output_device_id).run()
+        });
         Self { tx }
+    }
+
+    /// List available audio input devices.
+    pub fn list_input_devices() -> Vec<DeviceInfo> {
+        CpalEnumerator.default_host().input_devices()
+    }
+
+    /// List available audio output devices.
+    pub fn list_output_devices() -> Vec<DeviceInfo> {
+        CpalEnumerator.default_host().output_devices()
     }
 
     pub async fn default_input(&self) -> Result<InputStream> {
@@ -59,8 +85,13 @@ impl AudioBackend {
         self.tx
             .send(DriverMessage::InputStream { format, reply })
             .await?;
-        let handle = reply_rx.await??;
-        Ok(InputStream { handle, format })
+        let (handle, peaks) = reply_rx.await??;
+        Ok(InputStream {
+            handle,
+            format,
+            peaks,
+            normalizer: DbMeterNormalizer::new(-60., 0., -20.),
+        })
     }
 
     pub async fn default_output(&self) -> Result<OutputStream> {
@@ -175,10 +206,26 @@ impl OutputStream {
 }
 
 /// A simple AudioSource that reads from the default microphone via Firewheel.
+///
+/// Includes a peak meter so the application can display a mic activity
+/// indicator (VU meter) without modifying the audio samples.
 #[derive(Clone)]
 pub struct InputStream {
     handle: StreamReaderHandle,
     format: AudioFormat,
+    peaks: Arc<Mutex<PeakMeterSmoother<1>>>,
+    normalizer: DbMeterNormalizer,
+}
+
+impl InputStream {
+    /// Get the smoothed peak level of the microphone input, normalized
+    /// to a 0.0–1.0 range suitable for driving a VU meter UI.
+    pub fn smoothed_peak_normalized(&self) -> f32 {
+        self.peaks
+            .lock()
+            .expect("poisoned")
+            .smoothed_peaks_normalized_mono(&self.normalizer)
+    }
 }
 
 impl AudioSource for InputStream {
@@ -231,7 +278,7 @@ enum DriverMessage {
     InputStream {
         format: AudioFormat,
         #[debug("Sender")]
-        reply: oneshot::Sender<Result<StreamReaderHandle>>,
+        reply: oneshot::Sender<Result<(StreamReaderHandle, Arc<Mutex<PeakMeterSmoother<1>>>)>>,
     },
 }
 
@@ -242,27 +289,31 @@ struct AudioDriver {
     aec_render_node: NodeID,
     aec_capture_node: NodeID,
     peak_meters: HashMap<NodeID, Arc<Mutex<PeakMeterSmoother<2>>>>,
+    mono_peak_meters: HashMap<NodeID, Arc<Mutex<PeakMeterSmoother<1>>>>,
 }
 
 impl AudioDriver {
     fn new(rx: mpsc::Receiver<DriverMessage>) -> Self {
+        Self::new_with_devices(rx, None, None)
+    }
+
+    fn new_with_devices(
+        rx: mpsc::Receiver<DriverMessage>,
+        input_device_id: Option<DeviceId>,
+        output_device_id: Option<DeviceId>,
+    ) -> Self {
         let config = FirewheelConfig {
             num_graph_inputs: ChannelCount::new(1).unwrap(),
             ..Default::default()
         };
         let mut cx = FirewheelContext::new(config);
-        // Device enumeration log removed — was crash site on macOS Sequoia
-        // with cpal 0.16.0 (fixed in cpal 0.17.0 via firewheel 0.10).
         let config = CpalConfig {
             output: CpalOutputConfig {
-                #[cfg(target_os = "linux")]
-                device_name: Some("pipewire".to_string()),
-
+                device_id: output_device_id,
                 ..Default::default()
             },
             input: Some(CpalInputConfig {
-                #[cfg(target_os = "linux")]
-                device_name: Some("pipewire".to_string()),
+                device_id: input_device_id,
                 fail_on_no_input: true,
                 ..Default::default()
             }),
@@ -301,6 +352,7 @@ impl AudioDriver {
             aec_render_node,
             aec_capture_node,
             peak_meters: Default::default(),
+            mono_peak_meters: Default::default(),
         }
     }
 
@@ -359,6 +411,15 @@ impl AudioDriver {
                     smoother.lock().expect("poisoned").update(
                         self.cx
                             .node_state::<PeakMeterState<2>>(*id)
+                            .unwrap()
+                            .peak_gain_db(DEFAULT_DB_EPSILON),
+                        delta.as_secs_f32(),
+                    );
+                }
+                for (id, smoother) in self.mono_peak_meters.iter_mut() {
+                    smoother.lock().expect("poisoned").update(
+                        self.cx
+                            .node_state::<PeakMeterState<1>>(*id)
                             .unwrap()
                             .peak_gain_db(DEFAULT_DB_EPSILON),
                         delta.as_secs_f32(),
@@ -470,7 +531,10 @@ impl AudioDriver {
         })
     }
 
-    fn input_stream(&mut self, format: AudioFormat) -> Result<StreamReaderHandle> {
+    fn input_stream(
+        &mut self,
+        format: AudioFormat,
+    ) -> Result<(StreamReaderHandle, Arc<Mutex<PeakMeterSmoother<1>>>)> {
         let sample_rate = format.sample_rate;
         let channel_count = format.channel_count;
         // Setup stream reader node
@@ -482,24 +546,42 @@ impl AudioDriver {
                 ..Default::default()
             }),
         );
+
+        // Insert a mono peak meter between the AEC capture node and the stream reader.
+        let peak_meter_node = PeakMeterNode::<1> { enabled: true };
+        let peak_meter_id = self.cx.add_node(peak_meter_node, None);
+        let peak_meter_smoother =
+            Arc::new(Mutex::new(PeakMeterSmoother::<1>::new(Default::default())));
+        self.mono_peak_meters
+            .insert(peak_meter_id, peak_meter_smoother.clone());
+
         let graph_in_node_id = self.aec_capture_node;
-        let graph_in_info = self
+        let num_capture_outputs = self
             .cx
             .node_info(graph_in_node_id)
-            .context("missing audio input node")?;
+            .context("missing audio input node")?
+            .info
+            .channel_config
+            .num_outputs
+            .get();
 
-        let layout: &[(PortIdx, PortIdx)] = match (
-            graph_in_info.info.channel_config.num_outputs.get(),
-            channel_count,
-        ) {
-            (0, _) => anyhow::bail!("audio input has no channels"),
-            (1, 2) => &[(0, 0), (0, 1)],
-            (2, 2) => &[(0, 0), (1, 1)],
-            (_, 1) => &[(0, 0)],
-            _ => &[(0, 0), (1, 1)],
+        // Connect: aec_capture → peak_meter (mono)
+        if num_capture_outputs == 0 {
+            anyhow::bail!("audio input has no channels");
+        }
+        // Always take first channel for mono peak meter
+        self.cx
+            .connect(graph_in_node_id, peak_meter_id, &[(0, 0)], false)
+            .unwrap();
+
+        // Connect: peak_meter (mono) → stream_reader
+        let meter_to_reader: &[(PortIdx, PortIdx)] = match channel_count {
+            0 => anyhow::bail!("audio stream has no channels"),
+            1 => &[(0, 0)],
+            _ => &[(0, 0), (0, 1)], // duplicate mono to stereo if needed
         };
         self.cx
-            .connect(graph_in_node_id, stream_reader_id, layout, false)
+            .connect(peak_meter_id, stream_reader_id, meter_to_reader, false)
             .unwrap();
 
         let input_stream_sample_rate = self.cx.stream_info().unwrap().sample_rate;
@@ -523,6 +605,6 @@ impl AudioDriver {
             .node_state::<StreamReaderState>(stream_reader_id)
             .unwrap()
             .handle();
-        Ok(Arc::new(handle))
+        Ok((Arc::new(handle), peak_meter_smoother))
     }
 }
