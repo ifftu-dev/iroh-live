@@ -16,12 +16,13 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info, info_span, trace, warn};
 
 use crate::{
-    av::{
-        AudioEncoder, AudioEncoderInner, AudioPreset, AudioSource, DecodeConfig, VideoEncoder,
-        VideoEncoderInner, VideoPreset, VideoSource,
-    },
-    subscribe::WatchTrack,
+    av::{AudioEncoder, AudioEncoderInner, AudioPreset, AudioSource},
     util::spawn_thread,
+};
+#[cfg(feature = "video")]
+use crate::{
+    av::{DecodeConfig, VideoEncoder, VideoEncoderInner, VideoPreset, VideoSource},
+    subscribe::WatchTrack,
 };
 
 pub struct PublishBroadcast {
@@ -77,6 +78,7 @@ impl PublishBroadcast {
     }
 
     /// Create a local WatchTrack from the current video source, if present.
+    #[cfg(feature = "video")]
     pub fn watch_local(&self, decode_config: DecodeConfig) -> Option<WatchTrack> {
         let (source, shutdown) = {
             let state = self.state.lock().expect("poisoned");
@@ -94,6 +96,7 @@ impl PublishBroadcast {
         ))
     }
 
+    #[cfg(feature = "video")]
     pub fn set_video(&mut self, renditions: Option<VideoRenditions>) -> Result<()> {
         match renditions {
             Some(renditions) => {
@@ -163,18 +166,23 @@ impl Drop for PublishBroadcast {
 #[derive(Default)]
 struct State {
     shutdown_token: CancellationToken,
+    #[cfg(feature = "video")]
     available_video: Option<VideoRenditions>,
     available_audio: Option<AudioRenditions>,
+    #[cfg(feature = "video")]
     active_video: HashMap<String, EncoderThread>,
     active_audio: HashMap<String, EncoderThread>,
 }
 
 impl State {
     fn stop_track(&mut self, name: &str) {
+        #[cfg(feature = "video")]
         let thread = self
             .active_video
             .remove(name)
             .or_else(|| self.active_audio.remove(name));
+        #[cfg(not(feature = "video"))]
+        let thread = self.active_audio.remove(name);
         if let Some(thread) = thread {
             thread.shutdown.cancel();
         }
@@ -187,6 +195,7 @@ impl State {
         self.available_audio = None;
     }
 
+    #[cfg(feature = "video")]
     fn remove_video(&mut self) {
         for (_name, thread) in self.active_video.drain() {
             thread.shutdown.cancel();
@@ -198,13 +207,15 @@ impl State {
         let name = track.info.name.clone();
         let track = hang::TrackProducer::new(track);
         let shutdown_token = self.shutdown_token.child_token();
+        #[cfg(feature = "video")]
         if let Some(video) = self.available_video.as_mut()
             && video.contains_rendition(&name)
         {
             let thread = video.start_encoder(&name, track, shutdown_token)?;
             self.active_video.insert(name, thread);
-            Ok(())
-        } else if let Some(audio) = self.available_audio.as_mut()
+            return Ok(());
+        }
+        if let Some(audio) = self.available_audio.as_mut()
             && audio.contains_rendition(&name)
         {
             let thread = audio.start_encoder(&name, track, shutdown_token)?;
@@ -281,6 +292,7 @@ impl AudioRenditions {
     }
 }
 
+#[cfg(feature = "video")]
 pub struct VideoRenditions {
     make_encoder: Box<dyn Fn(VideoPreset) -> Result<Box<dyn VideoEncoder>> + Send>,
     source: SharedVideoSource,
@@ -288,6 +300,7 @@ pub struct VideoRenditions {
     _shared_source_cancel_guard: DropGuard,
 }
 
+#[cfg(feature = "video")]
 impl VideoRenditions {
     pub fn new<E: VideoEncoder>(
         source: impl VideoSource,
@@ -339,6 +352,7 @@ impl VideoRenditions {
     }
 }
 
+#[cfg(feature = "video")]
 #[derive(Debug, Clone)]
 pub(crate) struct SharedVideoSource {
     name: String,
@@ -349,6 +363,7 @@ pub(crate) struct SharedVideoSource {
     subscriber_count: Arc<AtomicU32>,
 }
 
+#[cfg(feature = "video")]
 impl SharedVideoSource {
     fn new(mut source: impl VideoSource, shutdown: CancellationToken) -> Self {
         let name = source.name().to_string();
@@ -405,6 +420,7 @@ impl SharedVideoSource {
     }
 }
 
+#[cfg(feature = "video")]
 impl VideoSource for SharedVideoSource {
     fn name(&self) -> &str {
         &self.name
@@ -449,6 +465,7 @@ pub struct EncoderThread {
 }
 
 impl EncoderThread {
+    #[cfg(feature = "video")]
     pub fn spawn_video(
         mut source: impl VideoSource,
         mut encoder: impl VideoEncoderInner,

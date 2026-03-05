@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
+#[cfg(feature = "video")]
 use image::RgbaImage;
 use strum::{Display, EnumString, VariantNames};
 
@@ -35,7 +36,13 @@ impl AudioFormat {
 
 pub trait Decoders {
     type Audio: AudioDecoder;
+    #[cfg(feature = "video")]
     type Video: VideoDecoder;
+}
+
+/// Audio-only decoders trait (no video decoder required).
+pub trait AudioOnlyDecoders {
+    type Audio: AudioDecoder;
 }
 
 pub trait AudioSource: Send + 'static {
@@ -100,30 +107,35 @@ pub trait AudioDecoder: Send + 'static {
     fn pop_samples(&mut self) -> Result<Option<&[f32]>>;
 }
 
+#[cfg(feature = "video")]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PixelFormat {
     Rgba,
     Bgra,
 }
 
+#[cfg(feature = "video")]
 impl Default for PixelFormat {
     fn default() -> Self {
         PixelFormat::Rgba
     }
 }
 
+#[cfg(feature = "video")]
 #[derive(Clone, Debug)]
 pub struct VideoFormat {
     pub pixel_format: PixelFormat,
     pub dimensions: [u32; 2],
 }
 
+#[cfg(feature = "video")]
 #[derive(Clone, Debug)]
 pub struct VideoFrame {
     pub format: VideoFormat,
     pub raw: bytes::Bytes,
 }
 
+#[cfg(feature = "video")]
 pub trait VideoSource: Send + 'static {
     fn name(&self) -> &str;
     fn format(&self) -> VideoFormat;
@@ -132,12 +144,14 @@ pub trait VideoSource: Send + 'static {
     fn stop(&mut self) -> Result<()>;
 }
 
+#[cfg(feature = "video")]
 pub trait VideoEncoder: VideoEncoderInner {
     fn with_preset(preset: VideoPreset) -> Result<Self>
     where
         Self: Sized;
 }
 
+#[cfg(feature = "video")]
 pub trait VideoEncoderInner: Send + 'static {
     fn name(&self) -> &str;
     fn config(&self) -> hang::catalog::VideoConfig;
@@ -145,6 +159,7 @@ pub trait VideoEncoderInner: Send + 'static {
     fn pop_packet(&mut self) -> Result<Option<hang::Frame>>;
 }
 
+#[cfg(feature = "video")]
 impl VideoEncoderInner for Box<dyn VideoEncoder> {
     fn name(&self) -> &str {
         (&**self).name()
@@ -163,6 +178,7 @@ impl VideoEncoderInner for Box<dyn VideoEncoder> {
     }
 }
 
+#[cfg(feature = "video")]
 pub trait VideoDecoder: Send + 'static {
     fn new(config: &hang::catalog::VideoConfig, playback_config: &DecodeConfig) -> Result<Self>
     where
@@ -173,11 +189,13 @@ pub trait VideoDecoder: Send + 'static {
     fn set_viewport(&mut self, w: u32, h: u32);
 }
 
+#[cfg(feature = "video")]
 pub struct DecodedFrame {
     pub frame: image::Frame,
     pub timestamp: Duration,
 }
 
+#[cfg(feature = "video")]
 impl DecodedFrame {
     pub fn img(&self) -> &RgbaImage {
         self.frame.buffer()
@@ -190,6 +208,7 @@ pub enum AudioCodec {
     Opus,
 }
 
+#[cfg(feature = "video")]
 #[derive(Debug, Clone, Copy, Display, EnumString, VariantNames)]
 #[strum(serialize_all = "lowercase")]
 pub enum VideoCodec {
@@ -197,6 +216,7 @@ pub enum VideoCodec {
     Av1,
 }
 
+#[cfg(feature = "video")]
 #[derive(Debug, Clone, Copy, Display, EnumString, VariantNames, Eq, PartialEq, Ord, PartialOrd)]
 pub enum VideoPreset {
     #[strum(serialize = "180p")]
@@ -209,6 +229,7 @@ pub enum VideoPreset {
     P1080,
 }
 
+#[cfg(feature = "video")]
 impl VideoPreset {
     pub fn all() -> [VideoPreset; 4] {
         [Self::P180, Self::P360, Self::P720, Self::P1080]
@@ -253,6 +274,7 @@ pub enum Quality {
     Low,
 }
 
+#[cfg(feature = "video")]
 #[derive(Clone, Default)]
 pub struct DecodeConfig {
     pub pixel_format: PixelFormat,
@@ -260,6 +282,7 @@ pub struct DecodeConfig {
 
 #[derive(Clone, Default)]
 pub struct PlaybackConfig {
+    #[cfg(feature = "video")]
     pub decode_config: DecodeConfig,
     pub quality: Quality,
 }

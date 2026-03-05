@@ -1,9 +1,11 @@
 use iroh::{Endpoint, EndpointAddr};
 use iroh_moq::{Moq, MoqProtocolHandler, MoqSession};
 use moq_lite::BroadcastProducer;
+use moq_media::subscribe::SubscribeBroadcast;
+#[cfg(feature = "video")]
 use moq_media::{
     av::{AudioSink, Decoders, PlaybackConfig},
-    subscribe::{AvRemoteTrack, SubscribeBroadcast},
+    subscribe::AvRemoteTrack,
 };
 use n0_error::Result;
 use tracing::info;
@@ -36,6 +38,7 @@ impl Live {
         Ok((session, broadcast))
     }
 
+    #[cfg(feature = "video")]
     pub async fn watch_and_listen<D: Decoders>(
         &self,
         remote: impl Into<EndpointAddr>,
