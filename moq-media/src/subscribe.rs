@@ -19,8 +19,10 @@ use crate::{
     av::{AudioDecoder, AudioSink, AudioSinkHandle, Quality},
     util::spawn_thread,
 };
+#[cfg(any(feature = "video", feature = "video-ios"))]
+use crate::av::{DecodeConfig, DecodedFrame, Decoders, PlaybackConfig, VideoDecoder};
 #[cfg(feature = "video")]
-use crate::av::{DecodeConfig, DecodedFrame, Decoders, PlaybackConfig, VideoDecoder, VideoSource};
+use crate::av::VideoSource;
 #[cfg(feature = "video")]
 use crate::ffmpeg::util::Rescaler;
 
@@ -53,7 +55,7 @@ impl CatalogWrapper {
         }
     }
 
-    #[cfg(feature = "video")]
+    #[cfg(any(feature = "video", feature = "video-ios"))]
     pub fn video_renditions(&self) -> impl Iterator<Item = &str> {
         let mut renditions: Vec<_> = self
             .inner
@@ -78,7 +80,7 @@ impl CatalogWrapper {
             .map(|(name, _config)| name.as_str())
     }
 
-    #[cfg(feature = "video")]
+    #[cfg(any(feature = "video", feature = "video-ios"))]
     pub fn select_video_rendition(&self, quality: Quality) -> Result<String> {
         let video = self.inner.video.as_ref().context("no video published")?;
         let track_name =
@@ -159,7 +161,7 @@ impl SubscribeBroadcast {
         self.catalog_watchable.get()
     }
 
-    #[cfg(feature = "video")]
+    #[cfg(any(feature = "video", feature = "video-ios"))]
     pub fn watch_and_listen<D: Decoders>(
         self,
         audio_out: impl AudioSink,
@@ -168,12 +170,12 @@ impl SubscribeBroadcast {
         AvRemoteTrack::new::<D>(self, audio_out, playback_config)
     }
 
-    #[cfg(feature = "video")]
+    #[cfg(any(feature = "video", feature = "video-ios"))]
     pub fn watch<D: VideoDecoder>(&self) -> Result<WatchTrack> {
         self.watch_with::<D>(&Default::default(), Quality::Highest)
     }
 
-    #[cfg(feature = "video")]
+    #[cfg(any(feature = "video", feature = "video-ios"))]
     pub fn watch_with<D: VideoDecoder>(
         &self,
         playback_config: &DecodeConfig,
@@ -183,7 +185,7 @@ impl SubscribeBroadcast {
         self.watch_rendition::<D>(playback_config, &track_name)
     }
 
-    #[cfg(feature = "video")]
+    #[cfg(any(feature = "video", feature = "video-ios"))]
     pub fn watch_rendition<D: VideoDecoder>(
         &self,
         playback_config: &DecodeConfig,
@@ -271,7 +273,7 @@ fn select_rendition<T, P: ToString>(
         .or_else(|| renditions.keys().next().cloned())
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 fn select_video_rendition<'a, T>(
     renditions: &'a BTreeMap<String, T>,
     q: Quality,
@@ -430,20 +432,20 @@ impl Drop for AudioTrack {
     }
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 pub struct WatchTrack {
     video_frames: WatchTrackFrames,
     handle: WatchTrackHandle,
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 pub struct WatchTrackHandle {
     rendition: String,
     viewport: Watchable<(u32, u32)>,
     _guard: WatchTrackGuard,
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 impl WatchTrackHandle {
     pub fn set_viewport(&self, w: u32, h: u32) {
         self.viewport.set((w, h)).ok();
@@ -454,12 +456,12 @@ impl WatchTrackHandle {
     }
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 pub struct WatchTrackFrames {
     rx: mpsc::Receiver<DecodedFrame>,
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 impl WatchTrackFrames {
     pub fn current_frame(&mut self) -> Option<DecodedFrame> {
         let mut out = None;
@@ -478,14 +480,14 @@ impl WatchTrackFrames {
     }
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 struct WatchTrackGuard {
     _shutdown_token_guard: DropGuard,
     _task_handle: Option<AbortOnDropHandle<()>>,
     _thread_handle: Option<std::thread::JoinHandle<()>>,
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 impl WatchTrack {
     pub fn empty(rendition: impl ToString) -> Self {
         let (tx, rx) = mpsc::channel(1);
@@ -508,6 +510,8 @@ impl WatchTrack {
         }
     }
 
+    /// Local video preview — requires ffmpeg Rescaler (desktop only).
+    #[cfg(feature = "video")]
     pub fn from_video_source(
         rendition: String,
         shutdown: CancellationToken,
@@ -697,14 +701,14 @@ async fn forward_frames(mut track: hang::TrackConsumer, sender: mpsc::Sender<han
     }
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 pub struct AvRemoteTrack {
     pub broadcast: SubscribeBroadcast,
     pub video: Option<WatchTrack>,
     pub audio: Option<AudioTrack>,
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 impl AvRemoteTrack {
     pub fn new<D: Decoders>(
         broadcast: SubscribeBroadcast,

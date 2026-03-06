@@ -20,10 +20,9 @@ use crate::{
     util::spawn_thread,
 };
 #[cfg(feature = "video")]
-use crate::{
-    av::{DecodeConfig, VideoEncoder, VideoEncoderInner, VideoPreset, VideoSource},
-    subscribe::WatchTrack,
-};
+use crate::{av::DecodeConfig, subscribe::WatchTrack};
+#[cfg(any(feature = "video", feature = "video-ios"))]
+use crate::av::{VideoEncoder, VideoEncoderInner, VideoPreset, VideoSource};
 
 pub struct PublishBroadcast {
     producer: BroadcastProducer,
@@ -96,7 +95,7 @@ impl PublishBroadcast {
         ))
     }
 
-    #[cfg(feature = "video")]
+    #[cfg(any(feature = "video", feature = "video-ios"))]
     pub fn set_video(&mut self, renditions: Option<VideoRenditions>) -> Result<()> {
         match renditions {
             Some(renditions) => {
@@ -166,22 +165,22 @@ impl Drop for PublishBroadcast {
 #[derive(Default)]
 struct State {
     shutdown_token: CancellationToken,
-    #[cfg(feature = "video")]
+    #[cfg(any(feature = "video", feature = "video-ios"))]
     available_video: Option<VideoRenditions>,
     available_audio: Option<AudioRenditions>,
-    #[cfg(feature = "video")]
+    #[cfg(any(feature = "video", feature = "video-ios"))]
     active_video: HashMap<String, EncoderThread>,
     active_audio: HashMap<String, EncoderThread>,
 }
 
 impl State {
     fn stop_track(&mut self, name: &str) {
-        #[cfg(feature = "video")]
+        #[cfg(any(feature = "video", feature = "video-ios"))]
         let thread = self
             .active_video
             .remove(name)
             .or_else(|| self.active_audio.remove(name));
-        #[cfg(not(feature = "video"))]
+        #[cfg(not(any(feature = "video", feature = "video-ios")))]
         let thread = self.active_audio.remove(name);
         if let Some(thread) = thread {
             thread.shutdown.cancel();
@@ -195,7 +194,7 @@ impl State {
         self.available_audio = None;
     }
 
-    #[cfg(feature = "video")]
+    #[cfg(any(feature = "video", feature = "video-ios"))]
     fn remove_video(&mut self) {
         for (_name, thread) in self.active_video.drain() {
             thread.shutdown.cancel();
@@ -207,7 +206,7 @@ impl State {
         let name = track.info.name.clone();
         let track = hang::TrackProducer::new(track);
         let shutdown_token = self.shutdown_token.child_token();
-        #[cfg(feature = "video")]
+        #[cfg(any(feature = "video", feature = "video-ios"))]
         if let Some(video) = self.available_video.as_mut()
             && video.contains_rendition(&name)
         {
@@ -292,7 +291,7 @@ impl AudioRenditions {
     }
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 pub struct VideoRenditions {
     make_encoder: Box<dyn Fn(VideoPreset) -> Result<Box<dyn VideoEncoder>> + Send>,
     source: SharedVideoSource,
@@ -300,7 +299,7 @@ pub struct VideoRenditions {
     _shared_source_cancel_guard: DropGuard,
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 impl VideoRenditions {
     pub fn new<E: VideoEncoder>(
         source: impl VideoSource,
@@ -352,7 +351,7 @@ impl VideoRenditions {
     }
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 #[derive(Debug, Clone)]
 pub(crate) struct SharedVideoSource {
     name: String,
@@ -363,7 +362,7 @@ pub(crate) struct SharedVideoSource {
     subscriber_count: Arc<AtomicU32>,
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 impl SharedVideoSource {
     fn new(mut source: impl VideoSource, shutdown: CancellationToken) -> Self {
         let name = source.name().to_string();
@@ -420,7 +419,7 @@ impl SharedVideoSource {
     }
 }
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 impl VideoSource for SharedVideoSource {
     fn name(&self) -> &str {
         &self.name
@@ -465,7 +464,7 @@ pub struct EncoderThread {
 }
 
 impl EncoderThread {
-    #[cfg(feature = "video")]
+    #[cfg(any(feature = "video", feature = "video-ios"))]
     pub fn spawn_video(
         mut source: impl VideoSource,
         mut encoder: impl VideoEncoderInner,

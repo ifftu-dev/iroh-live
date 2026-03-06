@@ -8,5 +8,7 @@ pub mod opus;
 pub mod publish;
 pub mod subscribe;
 mod util;
+#[cfg(feature = "video-ios")]
+pub mod videotoolbox;
 
 pub use audio::AudioBackend;

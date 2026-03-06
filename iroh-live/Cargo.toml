@@ -50,5 +50,8 @@ aec = ["moq-media/aec"]
 # Full video + audio support (requires ffmpeg, nokhwa, xcap)
 video = ["moq-media/video", "dep:image"]
 
+# iOS-only video support (VideoToolbox H264, no ffmpeg/nokhwa/xcap)
+video-ios = ["moq-media/video-ios", "dep:image"]
+
 # Enable static build of ffmpeg (implies video)
 static = ["video", "moq-media/static"]

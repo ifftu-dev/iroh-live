@@ -57,6 +57,10 @@ aec = ["dep:webrtc-audio-processing"]
 # Full video + audio support (requires ffmpeg, nokhwa, xcap)
 video = ["dep:ffmpeg-next", "dep:nokhwa", "dep:xcap", "dep:image"]
 
+# iOS-only video support (VideoToolbox H264 encoder/decoder, no ffmpeg/nokhwa/xcap).
+# Activates the shared video types/traits in av.rs and the `videotoolbox` module.
+video-ios = ["dep:image"]
+
 # Enable static build of ffmpeg (implies video)
 static = [
   "video",
