@@ -7,13 +7,21 @@
 //! ## Architecture
 //!
 //! 1. Creates an `AVCaptureSession` with `.medium` preset (640x480 BGRA).
-//! 2. Adds an `AVCaptureDeviceInput` for the back camera (or front as fallback).
+//! 2. Adds an `AVCaptureDeviceInput` for the front camera (or back as fallback).
 //! 3. Adds an `AVCaptureVideoDataOutput` configured for BGRA pixel format.
 //! 4. Sets a delegate (Rust-allocated ObjC class) that receives
 //!    `captureOutput:didOutputSampleBuffer:fromConnection:` callbacks.
 //! 5. The delegate callback locks the CVPixelBuffer, copies BGRA data, and
 //!    pushes it into a `std::sync::mpsc::SyncSender<VideoFrame>`.
 //! 6. `pop_frame()` drains the receiver, returning the latest frame.
+//!
+//! ## Important
+//!
+//! AVFoundation NSString constants (e.g. `AVCaptureSessionPresetMedium`,
+//! `AVMediaTypeVideo`) are loaded at runtime via `dlsym` from the framework
+//! binary — NOT created as literal NSStrings. This is critical because these
+//! constants are framework-exported `NSString *` globals, and passing a
+//! manually-created NSString with the same text content will NOT match.
 //!
 //! ## Safety
 //!
@@ -76,7 +84,13 @@ unsafe extern "C" {
 
     // CoreMedia
     fn CMSampleBufferGetImageBuffer(sbuf: CMSampleBufferRef) -> CVPixelBufferRef;
+
+    // Dynamic linker
+    fn dlsym(handle: *mut c_void, symbol: *const u8) -> *mut c_void;
 }
+
+/// Sentinel handle meaning "search all loaded dylibs".
+const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
 
 // Helper macros for ObjC messaging
 macro_rules! msg_send {
@@ -88,6 +102,28 @@ macro_rules! msg_send {
         let sel = sel_registerName(concat!($sel, "\0").as_ptr());
         objc_msgSend($obj, sel, $($arg),+)
     }};
+}
+
+// ── Framework constant loading ──────────────────────────────────────
+
+/// Load an `NSString *` constant exported by a framework (e.g. AVFoundation).
+///
+/// These constants are global `NSString *` variables whose *address* is the
+/// symbol. `dlsym` returns a pointer to the global, so we dereference once
+/// to get the actual `NSString *` (`Id`).
+///
+/// Returns `NIL` if the symbol isn't found.
+unsafe fn load_framework_nsstring(symbol: &[u8]) -> Id {
+    let ptr = dlsym(RTLD_DEFAULT, symbol.as_ptr());
+    if ptr.is_null() {
+        tracing::warn!(
+            "dlsym failed for {:?}",
+            std::str::from_utf8(&symbol[..symbol.len().saturating_sub(1)]).unwrap_or("?")
+        );
+        return NIL;
+    }
+    // The symbol is a `NSString * const` global — read the pointer value.
+    *(ptr as *const Id)
 }
 
 // ── Delegate class registration ─────────────────────────────────────
@@ -236,6 +272,12 @@ impl IosCameraSource {
         ensure_delegate_class();
 
         unsafe {
+            // Load framework constants via dlsym
+            let preset_medium = load_framework_nsstring(b"AVCaptureSessionPresetMedium\0");
+            if preset_medium.is_null() {
+                bail!("Failed to load AVCaptureSessionPresetMedium constant");
+            }
+
             // Create AVCaptureSession
             let session_class = objc_getClass(b"AVCaptureSession\0".as_ptr());
             if session_class.is_null() {
@@ -246,13 +288,9 @@ impl IosCameraSource {
                 bail!("Failed to create AVCaptureSession");
             }
 
-            // Set preset to Medium (640x480)
+            // Set preset to Medium (640x480) using the real framework constant
             let preset_sel = sel_registerName(b"setSessionPreset:\0".as_ptr());
-            // AVCaptureSessionPresetMedium is an NSString constant
-            let preset_str = get_nsstring("AVCaptureSessionPresetMedium");
-            if !preset_str.is_null() {
-                objc_msgSend(session, preset_sel, preset_str);
-            }
+            objc_msgSend(session, preset_sel, preset_medium);
 
             // Get camera device
             let device = find_camera_device(position);
@@ -306,7 +344,7 @@ impl IosCameraSource {
             bail!("Failed to create AVCaptureVideoDataOutput");
         }
 
-        // Set pixel format to BGRA
+        // Set pixel format to BGRA using the real kCVPixelBufferPixelFormatTypeKey
         let settings = create_pixel_format_settings(K_CV_PIXEL_FORMAT_TYPE_32_BGRA);
         if !settings.is_null() {
             let sel = sel_registerName(b"setVideoSettings:\0".as_ptr());
@@ -463,9 +501,9 @@ unsafe fn find_camera_device(position: isize) -> Id {
         return NIL;
     }
 
-    // Try AVCaptureDevice.defaultDeviceWithDeviceType:mediaType:position:
-    let device_type = get_nsstring("AVCaptureDeviceTypeBuiltInWideAngleCamera");
-    let media_type = get_nsstring("AVMediaTypeVideo");
+    // Load framework constants
+    let device_type = load_framework_nsstring(b"AVCaptureDeviceTypeBuiltInWideAngleCamera\0");
+    let media_type = load_framework_nsstring(b"AVMediaTypeVideo\0");
 
     if !device_type.is_null() && !media_type.is_null() {
         let sel = sel_registerName(b"defaultDeviceWithDeviceType:mediaType:position:\0".as_ptr());
@@ -476,34 +514,21 @@ unsafe fn find_camera_device(position: isize) -> Id {
     }
 
     // Fallback: AVCaptureDevice.defaultDeviceWithMediaType:
-    if position == 1 || position == 2 {
+    if !media_type.is_null() {
         let sel = sel_registerName(b"defaultDeviceWithMediaType:\0".as_ptr());
-        let avmedia_video = get_nsstring("AVMediaTypeVideo");
-        if !avmedia_video.is_null() {
-            let device: Id = objc_msgSend(device_class, sel, avmedia_video);
-            if !device.is_null() {
-                return device;
-            }
+        let device: Id = objc_msgSend(device_class, sel, media_type);
+        if !device.is_null() {
+            return device;
         }
     }
 
     NIL
 }
 
-/// Get an NSString constant by looking it up from the AVFoundation framework symbol.
-/// Falls back to creating an NSString from a UTF-8 literal.
-unsafe fn get_nsstring(name: &str) -> Id {
-    // Create NSString from literal
-    let nsstring_class = objc_getClass(b"NSString\0".as_ptr());
-    if nsstring_class.is_null() {
-        return NIL;
-    }
-    let c_str = std::ffi::CString::new(name).unwrap_or_default();
-    let sel = sel_registerName(b"stringWithUTF8String:\0".as_ptr());
-    objc_msgSend(nsstring_class, sel, c_str.as_ptr())
-}
-
 /// Create an NSDictionary with kCVPixelBufferPixelFormatTypeKey → pixel format.
+///
+/// Uses the real `kCVPixelBufferPixelFormatTypeKey` framework constant
+/// loaded via `dlsym`.
 unsafe fn create_pixel_format_settings(pixel_format: u32) -> Id {
     let nsnum_class = objc_getClass(b"NSNumber\0".as_ptr());
     let nsdict_class = objc_getClass(b"NSDictionary\0".as_ptr());
@@ -516,8 +541,8 @@ unsafe fn create_pixel_format_settings(pixel_format: u32) -> Id {
         objc_msgSend(nsnum_class, sel, pixel_format)
     };
 
-    // Key: kCVPixelBufferPixelFormatTypeKey (which is the NSString "PixelFormatType")
-    let key = get_nsstring("PixelFormatType");
+    // Load the real kCVPixelBufferPixelFormatTypeKey constant
+    let key = load_framework_nsstring(b"kCVPixelBufferPixelFormatTypeKey\0");
     if key.is_null() || num.is_null() {
         return NIL;
     }
