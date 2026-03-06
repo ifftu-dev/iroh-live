@@ -42,7 +42,10 @@ tokio = { version = "1.48.0", features = ["full"] }
 tracing-subscriber = "0.3.20"
 
 [features]
-default = ["video"]
+default = ["video", "aec"]
+
+# Acoustic Echo Cancellation (requires webrtc-audio-processing which doesn't cross-compile to iOS)
+aec = ["moq-media/aec"]
 
 # Full video + audio support (requires ffmpeg, nokhwa, xcap)
 video = ["moq-media/video", "dep:image"]

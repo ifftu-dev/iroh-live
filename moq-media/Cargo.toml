@@ -36,7 +36,7 @@ tokio = { version = "1.48.0", features = ["sync"] }
 tokio-util = "0.7.17"
 tracing = "0.1.41"
 xcap = { version = "0.8", optional = true }
-webrtc-audio-processing = { version = "0.5.0", features = ["bundled"] }
+webrtc-audio-processing = { version = "0.5.0", features = ["bundled"], optional = true }
 bytes = "1.11.0"
 buf-list = "1.1.2"
 
@@ -49,7 +49,10 @@ tokio = { version = "1.48.0", features = ["full"] }
 tracing-subscriber = "0.3.20"
 
 [features]
-default = ["video"]
+default = ["video", "aec"]
+
+# Acoustic Echo Cancellation (requires webrtc-audio-processing which doesn't cross-compile to iOS)
+aec = ["dep:webrtc-audio-processing"]
 
 # Full video + audio support (requires ffmpeg, nokhwa, xcap)
 video = ["dep:ffmpeg-next", "dep:nokhwa", "dep:xcap", "dep:image"]

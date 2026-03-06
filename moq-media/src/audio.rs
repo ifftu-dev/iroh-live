@@ -29,12 +29,14 @@ pub use firewheel::cpal::cpal::DeviceId;
 use tokio::sync::{mpsc, mpsc::error::TryRecvError, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
+#[cfg(feature = "aec")]
 use self::aec::{AecCaptureNode, AecProcessor, AecProcessorConfig, AecRenderNode};
 use crate::{
     av::{AudioFormat, AudioSink, AudioSinkHandle, AudioSource},
     util::spawn_thread,
 };
 
+#[cfg(feature = "aec")]
 mod aec;
 
 type StreamWriterHandle = Arc<Mutex<StreamWriterState>>;
@@ -285,9 +287,14 @@ enum DriverMessage {
 struct AudioDriver {
     cx: FirewheelContext,
     rx: mpsc::Receiver<DriverMessage>,
+    #[cfg(feature = "aec")]
     aec_processor: AecProcessor,
-    aec_render_node: NodeID,
-    aec_capture_node: NodeID,
+    /// The node that sits between stream writers (output) and graph_out.
+    /// With AEC: this is the AecRenderNode. Without AEC: this is graph_out directly.
+    output_anchor: NodeID,
+    /// The node that sits between graph_in and stream readers (input).
+    /// With AEC: this is the AecCaptureNode. Without AEC: this is graph_in directly.
+    input_anchor: NodeID,
     peak_meters: HashMap<NodeID, Arc<Mutex<PeakMeterSmoother<2>>>>,
     mono_peak_meters: HashMap<NodeID, Arc<Mutex<PeakMeterSmoother<1>>>>,
 }
@@ -333,24 +340,40 @@ impl AudioDriver {
             num_outputs: ChannelCount::new(2).unwrap(),
         });
 
-        let aec_processor = AecProcessor::new(AecProcessorConfig::stereo_in_out(), true)
-            .expect("failed to initialize AEC processor");
-        let aec_render_node = cx.add_node(AecRenderNode::default(), Some(aec_processor.clone()));
-        let aec_capture_node = cx.add_node(AecCaptureNode::default(), Some(aec_processor.clone()));
+        #[cfg(feature = "aec")]
+        let (output_anchor, input_anchor, aec_processor) = {
+            let aec_processor = AecProcessor::new(AecProcessorConfig::stereo_in_out(), true)
+                .expect("failed to initialize AEC processor");
+            let aec_render_node =
+                cx.add_node(AecRenderNode::default(), Some(aec_processor.clone()));
+            let aec_capture_node =
+                cx.add_node(AecCaptureNode::default(), Some(aec_processor.clone()));
 
-        let layout = &[(0, 0), (1, 1)];
+            let layout = &[(0, 0), (1, 1)];
+            cx.connect(cx.graph_in_node_id(), aec_capture_node, layout, true)
+                .unwrap();
+            cx.connect(aec_render_node, cx.graph_out_node_id(), layout, true)
+                .unwrap();
 
-        cx.connect(cx.graph_in_node_id(), aec_capture_node, layout, true)
-            .unwrap();
-        cx.connect(aec_render_node, cx.graph_out_node_id(), layout, true)
-            .unwrap();
+            info!("AEC enabled: inserted capture and render nodes into audio graph");
+            (aec_render_node, aec_capture_node, aec_processor)
+        };
+
+        #[cfg(not(feature = "aec"))]
+        let (output_anchor, input_anchor) = {
+            // Without AEC, output streams connect directly to graph_out,
+            // and input streams read directly from graph_in.
+            info!("AEC disabled: using direct graph connections (no echo cancellation)");
+            (cx.graph_out_node_id(), cx.graph_in_node_id())
+        };
 
         Self {
             cx,
             rx,
+            #[cfg(feature = "aec")]
             aec_processor,
-            aec_render_node,
-            aec_capture_node,
+            output_anchor,
+            input_anchor,
             peak_meters: Default::default(),
             mono_peak_meters: Default::default(),
         }
@@ -359,6 +382,7 @@ impl AudioDriver {
     fn run(&mut self) {
         const INTERVAL: Duration = Duration::from_millis(10);
         const PEAK_UPDATE_INTERVAL: Duration = Duration::from_millis(40);
+        #[cfg(feature = "aec")]
         let mut last_delay: f64 = 0.;
         let mut last_peak_update = Instant::now();
 
@@ -394,6 +418,7 @@ impl AudioDriver {
                 // }
             }
 
+            #[cfg(feature = "aec")]
             if let Some(info) = self.cx.stream_info() {
                 let delay = info.input_to_output_latency_seconds;
                 if (last_delay - delay).abs() > (1. / 1000.) {
@@ -477,7 +502,7 @@ impl AudioDriver {
                 ..Default::default()
             }),
         );
-        let graph_out = self.aec_render_node;
+        let graph_out = self.output_anchor;
         // let graph_out_info = self
         //     .cx
         //     .node_info(graph_out)
@@ -555,7 +580,7 @@ impl AudioDriver {
         self.mono_peak_meters
             .insert(peak_meter_id, peak_meter_smoother.clone());
 
-        let graph_in_node_id = self.aec_capture_node;
+        let graph_in_node_id = self.input_anchor;
         let num_capture_outputs = self
             .cx
             .node_info(graph_in_node_id)
