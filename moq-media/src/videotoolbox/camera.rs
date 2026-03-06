@@ -12,7 +12,7 @@
 //! 4. Sets a delegate (Rust-allocated ObjC class) that receives
 //!    `captureOutput:didOutputSampleBuffer:fromConnection:` callbacks.
 //! 5. The delegate callback locks the CVPixelBuffer, copies BGRA data, and
-//!    pushes it into a `std::sync::mpsc::Sender<VideoFrame>`.
+//!    pushes it into a `std::sync::mpsc::SyncSender<VideoFrame>`.
 //! 6. `pop_frame()` drains the receiver, returning the latest frame.
 //!
 //! ## Safety
@@ -20,7 +20,7 @@
 //! Uses extensive `unsafe` for ObjC runtime and CoreVideo FFI.
 //! All ObjC objects are retained/released correctly.
 
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::sync::mpsc;
 
@@ -93,7 +93,7 @@ macro_rules! msg_send {
 // ── Delegate class registration ─────────────────────────────────────
 
 /// The delegate's `_frameSender` ivar stores a raw pointer to
-/// `Box<mpsc::Sender<VideoFrame>>`. It is set when the delegate is allocated
+/// `Box<mpsc::SyncSender<VideoFrame>>`. It is set when the delegate is allocated
 /// and freed when the camera source is dropped.
 static DELEGATE_CLASS_INIT: std::sync::Once = std::sync::Once::new();
 static mut DELEGATE_CLASS: Class = ptr::null_mut();
@@ -147,7 +147,7 @@ unsafe extern "C" fn delegate_callback(
     if sender_ptr.is_null() {
         return;
     }
-    let sender = &*(sender_ptr as *const mpsc::Sender<VideoFrame>);
+    let sender = &*(sender_ptr as *const mpsc::SyncSender<VideoFrame>);
 
     // Get pixel buffer from sample buffer
     let pixel_buffer = CMSampleBufferGetImageBuffer(sample_buffer as CMSampleBufferRef);
@@ -208,8 +208,8 @@ pub struct IosCameraSource {
     session: Id,  // AVCaptureSession (retained)
     delegate: Id, // AlexandriaFrameDelegate (retained)
     rx: mpsc::Receiver<VideoFrame>,
-    /// Leaked Box<Sender> — freed on drop.
-    sender_ptr: *mut mpsc::Sender<VideoFrame>,
+    /// Leaked Box<SyncSender> — freed on drop.
+    sender_ptr: *mut mpsc::SyncSender<VideoFrame>,
     width: u32,
     height: u32,
     running: bool,
@@ -316,7 +316,7 @@ impl IosCameraSource {
         // Discard late frames
         {
             let sel = sel_registerName(b"setAlwaysDiscardsLateVideoFrames:\0".as_ptr());
-            objc_msgSend(output, sel, YES);
+            objc_msgSend(output, sel, YES as c_int);
         }
 
         // Create delegate
