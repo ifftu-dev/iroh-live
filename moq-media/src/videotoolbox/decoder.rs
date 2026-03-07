@@ -61,6 +61,7 @@ unsafe extern "C" {
     ) -> CFNumberRef;
 
     static kCFAllocatorDefault: CFAllocatorRef;
+    static kCFAllocatorNull: CFAllocatorRef;
     static kCFTypeDictionaryKeyCallBacks: c_void;
     static kCFTypeDictionaryValueCallBacks: c_void;
 
@@ -159,6 +160,7 @@ pub struct VtDecoder {
     output: Arc<Mutex<VecDeque<RawDecodedFrame>>>,
     viewport_w: u32,
     viewport_h: u32,
+    frame_count: u64,
 }
 
 unsafe impl Send for VtDecoder {}
@@ -257,12 +259,20 @@ impl VideoDecoder for VtDecoder {
             bail!("VTDecompressionSessionCreate failed: {status}");
         }
 
+        tracing::info!(
+            "VtDecoder created: session={:?}, {}x{}",
+            session,
+            config.coded_width.unwrap_or(640),
+            config.coded_height.unwrap_or(480)
+        );
+
         Ok(Self {
             session,
             format_desc,
             output,
             viewport_w: config.coded_width.unwrap_or(640),
             viewport_h: config.coded_height.unwrap_or(480),
+            frame_count: 0,
         })
     }
 
@@ -281,14 +291,32 @@ impl VideoDecoder for VtDecoder {
             return Ok(());
         }
 
-        // Create CMBlockBuffer
+        self.frame_count += 1;
+        if self.frame_count <= 3 || self.frame_count % 30 == 0 {
+            let preview: String = data
+                .iter()
+                .take(16)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!(
+                "VtDecoder::push_packet #{}: {} bytes, keyframe={}, first 16: {preview}",
+                self.frame_count,
+                data.len(),
+                packet.keyframe
+            );
+        }
+
+        // Create CMBlockBuffer.
+        // IMPORTANT: Pass kCFAllocatorNull as blockAllocator so CoreMedia does NOT
+        // try to free our Rust-owned memory. We keep `data` alive until after decode.
         let mut block_buffer: CMBlockBufferRef = ptr::null();
         let status = unsafe {
             CMBlockBufferCreateWithMemoryBlock(
-                kCFAllocatorDefault,
+                kCFAllocatorDefault, // structureAllocator (for the CMBlockBuffer object itself)
                 data.as_ptr() as *const c_void,
                 data.len(),
-                kCFAllocatorDefault,
+                kCFAllocatorNull, // blockAllocator = NULL → CoreMedia won't free the memory
                 ptr::null(),
                 0,
                 data.len(),
@@ -326,7 +354,7 @@ impl VideoDecoder for VtDecoder {
             bail!("CMSampleBufferCreate failed: {status}");
         }
 
-        // Decode
+        // Decode (synchronous — data must stay alive through this call)
         let mut info_flags: u32 = 0;
         let dec_status = unsafe {
             VTDecompressionSessionDecodeFrame(
@@ -340,7 +368,7 @@ impl VideoDecoder for VtDecoder {
 
         unsafe { CFRelease(sample_buffer as _) };
 
-        // Keep data alive for the block buffer's lifetime
+        // Now it's safe to drop data — decode is complete (synchronous)
         drop(data);
 
         if dec_status != 0 {
