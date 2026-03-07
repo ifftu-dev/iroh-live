@@ -381,17 +381,41 @@ impl VideoDecoder for VtDecoder {
     }
 }
 
-/// Parse avcC extradata into SPS and PPS byte slices.
+/// Parse H.264 codec description into SPS and PPS byte slices.
 ///
-/// Accepts both version 0 (produced by some ffmpeg builds) and version 1
-/// (the standard ISO 14496-15 version). The SPS/PPS layout is identical
-/// for both versions.
+/// Supports two formats:
+/// 1. **avcC box** (ISO 14496-15): version 0 or 1, followed by profile/compat/level/length_size,
+///    then SPS count + SPS data + PPS count + PPS data.
+/// 2. **Annex B**: start codes (`00 00 00 01` or `00 00 01`) separating NAL units.
+///    SPS is NAL type 7, PPS is NAL type 8.
 fn parse_avcc(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-    if data.len() < 8 {
-        bail!("avcC too short: {} bytes", data.len());
+    if data.len() < 4 {
+        bail!("H.264 description too short: {} bytes", data.len());
     }
+
+    // Log first bytes for debugging
+    let hex_preview: String = data
+        .iter()
+        .take(32)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    tracing::info!("parse_avcc: {} bytes, first 32: {hex_preview}", data.len());
+
+    // Detect Annex B format: starts with 00 00 00 01 or 00 00 01
+    if (data.len() >= 4 && data[..4] == [0, 0, 0, 1]) || (data.len() >= 3 && data[..3] == [0, 0, 1])
+    {
+        tracing::info!("parse_avcc: detected Annex B format, parsing NAL units");
+        return parse_annex_b(data);
+    }
+
+    // avcC box format
     if data[0] > 1 {
         bail!("avcC version {} not supported (expected 0 or 1)", data[0]);
+    }
+
+    if data.len() < 8 {
+        bail!("avcC too short for box format: {} bytes", data.len());
     }
 
     let mut offset = 5; // skip version(1) + profile(1) + compat(1) + level(1) + length_size(1)
@@ -401,17 +425,27 @@ fn parse_avcc(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     offset += 1;
 
     if num_sps == 0 {
-        bail!("avcC: no SPS");
+        bail!("avcC: no SPS (num_sps=0)");
     }
 
     // Read first SPS
     if offset + 2 > data.len() {
-        bail!("avcC: truncated SPS length");
+        bail!(
+            "avcC: truncated SPS length at offset {offset}, data len {}",
+            data.len()
+        );
     }
     let sps_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
     offset += 2;
+    tracing::info!(
+        "parse_avcc: num_sps={num_sps}, sps_len={sps_len}, offset={offset}, remaining={}",
+        data.len() - offset
+    );
     if offset + sps_len > data.len() {
-        bail!("avcC: truncated SPS data");
+        bail!(
+            "avcC: truncated SPS data (need {sps_len} at offset {offset}, have {})",
+            data.len() - offset
+        );
     }
     let sps = data[offset..offset + sps_len].to_vec();
     offset += sps_len;
@@ -447,7 +481,88 @@ fn parse_avcc(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     }
     let pps = data[offset..offset + pps_len].to_vec();
 
+    tracing::info!(
+        "parse_avcc: OK, sps={} bytes, pps={} bytes",
+        sps.len(),
+        pps.len()
+    );
     Ok((sps, pps))
+}
+
+/// Parse Annex B byte stream to extract SPS (NAL type 7) and PPS (NAL type 8).
+fn parse_annex_b(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut sps: Option<Vec<u8>> = None;
+    let mut pps: Option<Vec<u8>> = None;
+
+    // Find all NAL unit boundaries (00 00 00 01 or 00 00 01)
+    let mut i = 0;
+    let mut nalu_starts: Vec<usize> = Vec::new();
+    while i < data.len() {
+        if i + 3 < data.len()
+            && data[i] == 0
+            && data[i + 1] == 0
+            && data[i + 2] == 0
+            && data[i + 3] == 1
+        {
+            nalu_starts.push(i + 4);
+            i += 4;
+        } else if i + 2 < data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            nalu_starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+
+    for (idx, &start) in nalu_starts.iter().enumerate() {
+        if start >= data.len() {
+            continue;
+        }
+        let end = if idx + 1 < nalu_starts.len() {
+            // Find the start code before the next NAL unit
+            let next = nalu_starts[idx + 1];
+            // Back up past the start code
+            if next >= 4
+                && data[next - 4] == 0
+                && data[next - 3] == 0
+                && data[next - 2] == 0
+                && data[next - 1] == 1
+            {
+                next - 4
+            } else if next >= 3 && data[next - 3] == 0 && data[next - 2] == 0 && data[next - 1] == 1
+            {
+                next - 3
+            } else {
+                next
+            }
+        } else {
+            data.len()
+        };
+
+        let nal_data = &data[start..end];
+        if nal_data.is_empty() {
+            continue;
+        }
+
+        let nal_type = nal_data[0] & 0x1F;
+        match nal_type {
+            7 => {
+                tracing::info!("parse_annex_b: found SPS ({} bytes)", nal_data.len());
+                sps = Some(nal_data.to_vec());
+            }
+            8 => {
+                tracing::info!("parse_annex_b: found PPS ({} bytes)", nal_data.len());
+                pps = Some(nal_data.to_vec());
+            }
+            _ => {}
+        }
+    }
+
+    match (sps, pps) {
+        (Some(s), Some(p)) => Ok((s, p)),
+        (None, _) => bail!("Annex B: no SPS NAL unit found"),
+        (_, None) => bail!("Annex B: no PPS NAL unit found"),
+    }
 }
 
 /// VTDecompressionSession output callback.
