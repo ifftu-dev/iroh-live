@@ -285,7 +285,41 @@ impl Actor {
             }
             let live = self.live.clone();
             self.connecting.push(Box::pin(async move {
-                let session = live.connect_and_subscribe(remote, &name).await;
+                tracing::info!(
+                    remote = %remote.fmt_short(),
+                    name = %name,
+                    "room: starting connect_and_subscribe"
+                );
+                let result = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    live.connect_and_subscribe(remote, &name),
+                ).await;
+                let session = match result {
+                    Ok(inner) => {
+                        match &inner {
+                            Ok(_) => tracing::info!(
+                                remote = %remote.fmt_short(),
+                                name = %name,
+                                "room: connect_and_subscribe succeeded"
+                            ),
+                            Err(e) => tracing::warn!(
+                                remote = %remote.fmt_short(),
+                                name = %name,
+                                error = %e,
+                                "room: connect_and_subscribe failed"
+                            ),
+                        }
+                        inner
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            remote = %remote.fmt_short(),
+                            name = %name,
+                            "room: connect_and_subscribe timed out after 30s"
+                        );
+                        Err(n0_error::anyerr!("connect_and_subscribe timed out after 30s"))
+                    }
+                };
                 (id, session)
             }));
         }
