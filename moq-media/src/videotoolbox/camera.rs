@@ -92,16 +92,75 @@ unsafe extern "C" {
 /// Sentinel handle meaning "search all loaded dylibs".
 const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
 
-// Helper macros for ObjC messaging
-macro_rules! msg_send {
-    ($obj:expr, $sel:expr) => {{
-        let sel = sel_registerName(concat!($sel, "\0").as_ptr());
-        objc_msgSend($obj, sel)
-    }};
-    ($obj:expr, $sel:expr, $($arg:expr),+) => {{
-        let sel = sel_registerName(concat!($sel, "\0").as_ptr());
-        objc_msgSend($obj, sel, $($arg),+)
-    }};
+// ── Typed objc_msgSend wrappers ─────────────────────────────────────
+//
+// On arm64 iOS, the C variadic `objc_msgSend(Id, Sel, ...)` declaration
+// causes extra arguments to be passed in **variadic registers** (stack),
+// but ObjC methods expect them in **fixed parameter registers** (x2, x3, …).
+// This ABI mismatch causes SIGSEGV. The fix is to transmute `objc_msgSend`
+// to a concrete function pointer type matching the exact method signature
+// before each call.
+
+/// Zero-arg message send (e.g. `[obj alloc]`, `[obj init]`, `[obj release]`).
+/// These are safe even with variadic decl, but we use typed version for consistency.
+unsafe fn msg_send_0(obj: Id, sel_name: &[u8]) -> Id {
+    type F = unsafe extern "C" fn(Id, Sel) -> Id;
+    let sel = sel_registerName(sel_name.as_ptr());
+    let f: F = std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel, ...) -> Id);
+    f(obj, sel)
+}
+
+/// One-arg message send where arg is Id (pointer-sized).
+unsafe fn msg_send_1id(obj: Id, sel_name: &[u8], a1: Id) -> Id {
+    type F = unsafe extern "C" fn(Id, Sel, Id) -> Id;
+    let sel = sel_registerName(sel_name.as_ptr());
+    let f: F = std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel, ...) -> Id);
+    f(obj, sel, a1)
+}
+
+/// One-arg message send where arg is c_int (for BOOL/int params).
+unsafe fn msg_send_1int(obj: Id, sel_name: &[u8], a1: c_int) -> Id {
+    type F = unsafe extern "C" fn(Id, Sel, c_int) -> Id;
+    let sel = sel_registerName(sel_name.as_ptr());
+    let f: F = std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel, ...) -> Id);
+    f(obj, sel, a1)
+}
+
+/// One-arg message send where arg is u32 (for numberWithUnsignedInt:).
+unsafe fn msg_send_1u32(obj: Id, sel_name: &[u8], a1: u32) -> Id {
+    type F = unsafe extern "C" fn(Id, Sel, u32) -> Id;
+    let sel = sel_registerName(sel_name.as_ptr());
+    let f: F = std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel, ...) -> Id);
+    f(obj, sel, a1)
+}
+
+/// Two-arg message send (Id, Id) — e.g. `[dict dictionaryWithObject:forKey:]`.
+unsafe fn msg_send_2id(obj: Id, sel_name: &[u8], a1: Id, a2: Id) -> Id {
+    type F = unsafe extern "C" fn(Id, Sel, Id, Id) -> Id;
+    let sel = sel_registerName(sel_name.as_ptr());
+    let f: F = std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel, ...) -> Id);
+    f(obj, sel, a1, a2)
+}
+
+/// Two-arg message send (Id, *mut Id) — e.g. `[cls deviceInputWithDevice:error:]`.
+unsafe fn msg_send_id_perr(obj: Id, sel_name: &[u8], a1: Id, a2: *mut Id) -> Id {
+    type F = unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id;
+    let sel = sel_registerName(sel_name.as_ptr());
+    let f: F = std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel, ...) -> Id);
+    f(obj, sel, a1, a2)
+}
+
+/// Two-arg message send (Id, Id) — for setSampleBufferDelegate:queue:
+unsafe fn msg_send_id_id(obj: Id, sel_name: &[u8], a1: Id, a2: Id) -> Id {
+    msg_send_2id(obj, sel_name, a1, a2)
+}
+
+/// Three-arg message send (Id, Id, isize) — e.g. `defaultDeviceWithDeviceType:mediaType:position:`.
+unsafe fn msg_send_id_id_isize(obj: Id, sel_name: &[u8], a1: Id, a2: Id, a3: isize) -> Id {
+    type F = unsafe extern "C" fn(Id, Sel, Id, Id, isize) -> Id;
+    let sel = sel_registerName(sel_name.as_ptr());
+    let f: F = std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel, ...) -> Id);
+    f(obj, sel, a1, a2, a3)
 }
 
 // ── Framework constant loading ──────────────────────────────────────
@@ -283,14 +342,14 @@ impl IosCameraSource {
             if session_class.is_null() {
                 bail!("AVCaptureSession class not found");
             }
-            let session: Id = msg_send!(msg_send!(session_class, "alloc"), "init");
+            let alloc = msg_send_0(session_class, b"alloc\0");
+            let session: Id = msg_send_0(alloc, b"init\0");
             if session.is_null() {
                 bail!("Failed to create AVCaptureSession");
             }
 
             // Set preset to Medium (640x480) using the real framework constant
-            let preset_sel = sel_registerName(b"setSessionPreset:\0".as_ptr());
-            objc_msgSend(session, preset_sel, preset_medium);
+            msg_send_1id(session, b"setSessionPreset:\0", preset_medium);
 
             // Get camera device
             let device = find_camera_device(position);
@@ -313,32 +372,29 @@ impl IosCameraSource {
         // Create AVCaptureDeviceInput
         let input_class = objc_getClass(b"AVCaptureDeviceInput\0".as_ptr());
         let mut error: Id = NIL;
-        let input: Id = {
-            let sel = sel_registerName(b"deviceInputWithDevice:error:\0".as_ptr());
-            objc_msgSend(input_class, sel, device, &mut error as *mut Id)
-        };
+        let input: Id = msg_send_id_perr(
+            input_class,
+            b"deviceInputWithDevice:error:\0",
+            device,
+            &mut error as *mut Id,
+        );
         if input.is_null() || !error.is_null() {
             release(session);
             bail!("Failed to create AVCaptureDeviceInput");
         }
 
         // Add input
-        let can_add_input: BOOL = {
-            let sel = sel_registerName(b"canAddInput:\0".as_ptr());
-            objc_msgSend(session, sel, input) as BOOL
-        };
+        let can_add_input: BOOL = msg_send_1id(session, b"canAddInput:\0", input) as BOOL;
         if can_add_input != YES {
             release(session);
             bail!("Cannot add camera input to session");
         }
-        {
-            let sel = sel_registerName(b"addInput:\0".as_ptr());
-            objc_msgSend(session, sel, input);
-        }
+        msg_send_1id(session, b"addInput:\0", input);
 
         // Create AVCaptureVideoDataOutput
         let output_class = objc_getClass(b"AVCaptureVideoDataOutput\0".as_ptr());
-        let output: Id = msg_send!(msg_send!(output_class, "alloc"), "init");
+        let alloc_out = msg_send_0(output_class, b"alloc\0");
+        let output: Id = msg_send_0(alloc_out, b"init\0");
         if output.is_null() {
             release(session);
             bail!("Failed to create AVCaptureVideoDataOutput");
@@ -347,18 +403,15 @@ impl IosCameraSource {
         // Set pixel format to BGRA using the real kCVPixelBufferPixelFormatTypeKey
         let settings = create_pixel_format_settings(K_CV_PIXEL_FORMAT_TYPE_32_BGRA);
         if !settings.is_null() {
-            let sel = sel_registerName(b"setVideoSettings:\0".as_ptr());
-            objc_msgSend(output, sel, settings);
+            msg_send_1id(output, b"setVideoSettings:\0", settings);
         }
 
         // Discard late frames
-        {
-            let sel = sel_registerName(b"setAlwaysDiscardsLateVideoFrames:\0".as_ptr());
-            objc_msgSend(output, sel, YES as c_int);
-        }
+        msg_send_1int(output, b"setAlwaysDiscardsLateVideoFrames:\0", YES as c_int);
 
         // Create delegate
-        let delegate: Id = msg_send!(msg_send!(DELEGATE_CLASS, "alloc"), "init");
+        let alloc_del = msg_send_0(DELEGATE_CLASS, b"alloc\0");
+        let delegate: Id = msg_send_0(alloc_del, b"init\0");
         if delegate.is_null() {
             release(output);
             release(session);
@@ -379,16 +432,10 @@ impl IosCameraSource {
 
         // Set delegate with a serial dispatch queue
         let queue = create_dispatch_queue(b"org.alexandria.camera\0".as_ptr());
-        {
-            let sel = sel_registerName(b"setSampleBufferDelegate:queue:\0".as_ptr());
-            objc_msgSend(output, sel, delegate, queue);
-        }
+        msg_send_id_id(output, b"setSampleBufferDelegate:queue:\0", delegate, queue);
 
         // Add output
-        let can_add_output: BOOL = {
-            let sel = sel_registerName(b"canAddOutput:\0".as_ptr());
-            objc_msgSend(session, sel, output) as BOOL
-        };
+        let can_add_output: BOOL = msg_send_1id(session, b"canAddOutput:\0", output) as BOOL;
         if can_add_output != YES {
             release(delegate);
             release(output);
@@ -396,10 +443,7 @@ impl IosCameraSource {
             let _ = Box::from_raw(sender_ptr); // reclaim
             bail!("Cannot add video output to session");
         }
-        {
-            let sel = sel_registerName(b"addOutput:\0".as_ptr());
-            objc_msgSend(session, sel, output);
-        }
+        msg_send_1id(session, b"addOutput:\0", output);
 
         // We can release output — session retains it
         release(output);
@@ -420,7 +464,7 @@ impl Drop for IosCameraSource {
     fn drop(&mut self) {
         unsafe {
             if self.running {
-                msg_send!(self.session, "stopRunning");
+                msg_send_0(self.session, b"stopRunning\0");
             }
 
             // Clear delegate ivar to prevent dangling pointer
@@ -455,7 +499,7 @@ impl VideoSource for IosCameraSource {
             return Ok(());
         }
         unsafe {
-            msg_send!(self.session, "startRunning");
+            msg_send_0(self.session, b"startRunning\0");
         }
         self.running = true;
         tracing::info!("iOS camera started ({}x{})", self.width, self.height);
@@ -467,7 +511,7 @@ impl VideoSource for IosCameraSource {
             return Ok(());
         }
         unsafe {
-            msg_send!(self.session, "stopRunning");
+            msg_send_0(self.session, b"stopRunning\0");
         }
         self.running = false;
         // Drain any pending frames
@@ -490,7 +534,7 @@ impl VideoSource for IosCameraSource {
 
 unsafe fn release(obj: Id) {
     if !obj.is_null() {
-        msg_send!(obj, "release");
+        msg_send_0(obj, b"release\0");
     }
 }
 
@@ -506,8 +550,13 @@ unsafe fn find_camera_device(position: isize) -> Id {
     let media_type = load_framework_nsstring(b"AVMediaTypeVideo\0");
 
     if !device_type.is_null() && !media_type.is_null() {
-        let sel = sel_registerName(b"defaultDeviceWithDeviceType:mediaType:position:\0".as_ptr());
-        let device: Id = objc_msgSend(device_class, sel, device_type, media_type, position);
+        let device: Id = msg_send_id_id_isize(
+            device_class,
+            b"defaultDeviceWithDeviceType:mediaType:position:\0",
+            device_type,
+            media_type,
+            position,
+        );
         if !device.is_null() {
             return device;
         }
@@ -515,8 +564,7 @@ unsafe fn find_camera_device(position: isize) -> Id {
 
     // Fallback: AVCaptureDevice.defaultDeviceWithMediaType:
     if !media_type.is_null() {
-        let sel = sel_registerName(b"defaultDeviceWithMediaType:\0".as_ptr());
-        let device: Id = objc_msgSend(device_class, sel, media_type);
+        let device: Id = msg_send_1id(device_class, b"defaultDeviceWithMediaType:\0", media_type);
         if !device.is_null() {
             return device;
         }
@@ -536,10 +584,7 @@ unsafe fn create_pixel_format_settings(pixel_format: u32) -> Id {
         return NIL;
     }
 
-    let num: Id = {
-        let sel = sel_registerName(b"numberWithUnsignedInt:\0".as_ptr());
-        objc_msgSend(nsnum_class, sel, pixel_format)
-    };
+    let num: Id = msg_send_1u32(nsnum_class, b"numberWithUnsignedInt:\0", pixel_format);
 
     // Load the real kCVPixelBufferPixelFormatTypeKey constant
     let key = load_framework_nsstring(b"kCVPixelBufferPixelFormatTypeKey\0");
@@ -547,8 +592,7 @@ unsafe fn create_pixel_format_settings(pixel_format: u32) -> Id {
         return NIL;
     }
 
-    let sel = sel_registerName(b"dictionaryWithObject:forKey:\0".as_ptr());
-    objc_msgSend(nsdict_class, sel, num, key)
+    msg_send_2id(nsdict_class, b"dictionaryWithObject:forKey:\0", num, key)
 }
 
 // GCD dispatch queue creation
