@@ -382,12 +382,16 @@ impl VideoDecoder for VtDecoder {
 }
 
 /// Parse avcC extradata into SPS and PPS byte slices.
+///
+/// Accepts both version 0 (produced by some ffmpeg builds) and version 1
+/// (the standard ISO 14496-15 version). The SPS/PPS layout is identical
+/// for both versions.
 fn parse_avcc(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     if data.len() < 8 {
         bail!("avcC too short: {} bytes", data.len());
     }
-    if data[0] != 1 {
-        bail!("avcC version {} not supported (expected 1)", data[0]);
+    if data[0] > 1 {
+        bail!("avcC version {} not supported (expected 0 or 1)", data[0]);
     }
 
     let mut offset = 5; // skip version(1) + profile(1) + compat(1) + level(1) + length_size(1)
