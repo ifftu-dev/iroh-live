@@ -684,17 +684,29 @@ impl WatchTrack {
 }
 
 async fn forward_frames(mut track: hang::TrackConsumer, sender: mpsc::Sender<hang::Frame>) {
+    let mut count: u64 = 0;
     loop {
         let frame = track.read_frame().await;
         match frame {
             Ok(Some(frame)) => {
+                count += 1;
+                if count <= 3 || count % 100 == 0 {
+                    info!(
+                        "forward_frames: #{count} payload_bytes={} keyframe={}",
+                        frame.payload.num_bytes(),
+                        frame.keyframe
+                    );
+                }
                 if sender.send(frame).await.is_err() {
                     break;
                 }
             }
-            Ok(None) => break,
+            Ok(None) => {
+                info!("forward_frames: track ended after {count} frames");
+                break;
+            }
             Err(err) => {
-                warn!("failed to read frame: {err:?}");
+                warn!("forward_frames: failed to read frame after {count}: {err:?}");
                 break;
             }
         }
