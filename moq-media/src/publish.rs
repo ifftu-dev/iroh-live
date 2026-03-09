@@ -489,6 +489,9 @@ impl EncoderThread {
                 );
                 let framerate = encoder.config().framerate.unwrap_or(30.0);
                 let interval = Duration::from_secs_f64(1. / framerate);
+                let mut enc_frame_count: u64 = 0;
+                let mut enc_pkt_count: u64 = 0;
+                let mut null_frame_count: u64 = 0;
                 loop {
                     let start = Instant::now();
                     if shutdown.is_cancelled() {
@@ -503,14 +506,27 @@ impl EncoderThread {
                         }
                     };
                     if let Some(frame) = frame {
+                        enc_frame_count += 1;
                         if let Err(err) = encoder.push_frame(frame) {
                             warn!("video encoder failed: {err:#}");
                             break;
                         };
                         while let Ok(Some(pkt)) = encoder.pop_packet() {
+                            enc_pkt_count += 1;
+                            if enc_pkt_count <= 3 || enc_pkt_count % 100 == 0 {
+                                info!(
+                                    "videoenc: packet #{enc_pkt_count} (from {enc_frame_count} frames), bytes={}",
+                                    pkt.payload.num_bytes()
+                                );
+                            }
                             if let Err(err) = producer.write(pkt) {
                                 warn!("failed to write frame to producer: {err:#}");
                             }
+                        }
+                    } else {
+                        null_frame_count += 1;
+                        if null_frame_count == 1 || null_frame_count == 30 || null_frame_count % 300 == 0 {
+                            warn!("videoenc: source returned None ({null_frame_count} times, {enc_frame_count} frames so far)");
                         }
                     }
                     std::thread::sleep(interval.saturating_sub(start.elapsed()));
@@ -548,6 +564,8 @@ impl EncoderThread {
             let samples_per_frame = (format.sample_rate / 1000) * INTERVAL.as_millis() as u32;
             let mut buf = vec![0.0f32; samples_per_frame as usize * format.channel_count as usize];
             let start = Instant::now();
+            let mut audio_pkt_count: u64 = 0;
+            let mut audio_none_count: u64 = 0;
             for tick in 0.. {
                 trace!("tick");
                 if shutdown.is_cancelled() {
@@ -564,13 +582,23 @@ impl EncoderThread {
                             .pop_packet()
                             .inspect_err(|err| warn!("encoder error: {err:#}"))
                         {
+                            audio_pkt_count += 1;
+                            if audio_pkt_count <= 3 || audio_pkt_count % 500 == 0 {
+                                info!(
+                                    "audioenc: packet #{audio_pkt_count}, bytes={}",
+                                    pkt.payload.num_bytes()
+                                );
+                            }
                             if let Err(err) = producer.write(pkt) {
                                 warn!("failed to write frame to producer: {err:#}");
                             }
                         }
                     }
                     Ok(None) => {
-                        // keep pacing
+                        audio_none_count += 1;
+                        if audio_none_count == 1 || audio_none_count == 50 || audio_none_count % 500 == 0 {
+                            warn!("audioenc: source returned None ({audio_none_count} times)");
+                        }
                     }
                     Err(err) => {
                         error!("audio source failed: {err:#}");

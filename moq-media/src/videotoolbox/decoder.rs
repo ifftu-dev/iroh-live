@@ -663,8 +663,21 @@ unsafe extern "C" fn vt_decompress_callback(
         };
 
         if let Ok(mut q) = output.lock() {
+            let qlen = q.len();
             q.push_back(frame);
+            // Log first 3 decoded frames and every 50th queued frame
+            if qlen == 0 || qlen == 1 || qlen == 2 || (qlen + 1) % 50 == 0 {
+                tracing::info!(
+                    "VT callback: decoded frame queued, {width}x{height}, queue_len={}, ts={timestamp_us}us",
+                    qlen + 1
+                );
+            }
         }
+    } else {
+        tracing::warn!(
+            "VT callback: null/zero-size buffer, base_null={}, {width}x{height}",
+            base.is_null()
+        );
     }
 
     CVPixelBufferUnlockBaseAddress(image_buffer, 1);

@@ -368,18 +368,28 @@ impl AudioTrack {
         const INTERVAL: Duration = Duration::from_millis(10);
         let mut remote_start = None;
         let loop_start = Instant::now();
+        let mut audio_pkt_count: u64 = 0;
+        info!("audiodec: run_loop starting, waiting for packets...");
 
         'main: for i in 0.. {
             let tick = Instant::now();
 
             if shutdown.is_cancelled() {
-                debug!("stop audio thread: cancelled");
+                info!("audiodec: cancelled after {audio_pkt_count} packets");
                 break;
             }
 
             loop {
                 match packet_rx.try_recv() {
                     Ok(packet) => {
+                        audio_pkt_count += 1;
+                        if audio_pkt_count <= 3 || audio_pkt_count % 500 == 0 {
+                            info!(
+                                "audiodec: packet #{audio_pkt_count}, bytes={}, paused={}",
+                                packet.payload.num_bytes(),
+                                sink.is_paused()
+                            );
+                        }
                         let remote_start = *remote_start.get_or_insert_with(|| packet.timestamp);
 
                         if tracing::enabled!(tracing::Level::TRACE) {
@@ -404,7 +414,7 @@ impl AudioTrack {
                         }
                     }
                     Err(TryRecvError::Disconnected) => {
-                        debug!("stop audio thread: packet_rx disconnected");
+                        info!("audiodec: disconnected after {audio_pkt_count} packets");
                         break 'main;
                     }
                     Err(TryRecvError::Empty) => {
@@ -655,13 +665,19 @@ impl WatchTrack {
         mut viewport_watcher: n0_watcher::Direct<(u32, u32)>,
         mut decoder: impl VideoDecoder,
     ) -> Result<(), anyhow::Error> {
+        let mut pkt_count: u64 = 0;
+        let mut decoded_count: u64 = 0;
+        info!("videodec: run_loop starting, waiting for first packet...");
         loop {
             if shutdown.is_cancelled() {
+                info!("videodec: run_loop cancelled after {pkt_count} packets, {decoded_count} decoded frames");
                 break;
             }
             let Some(packet) = input_rx.blocking_recv() else {
+                info!("videodec: run_loop input channel closed after {pkt_count} packets, {decoded_count} decoded frames");
                 break;
             };
+            pkt_count += 1;
             if viewport_watcher.update() {
                 let (w, h) = viewport_watcher.peek();
                 decoder.set_viewport(*w, *h);
@@ -672,11 +688,21 @@ impl WatchTrack {
                 .context("failed to push packet")?;
             trace!(t=?t.elapsed(), "videodec: push_packet");
             while let Some(frame) = decoder.pop_frame().context("failed to pop frame")? {
-                trace!(t=?t.elapsed(), "videodec: pop frame");
+                decoded_count += 1;
+                if decoded_count <= 3 || decoded_count % 100 == 0 {
+                    info!(
+                        "videodec: decoded frame #{decoded_count} (from {pkt_count} packets), {}x{}, elapsed={:?}",
+                        frame.width, frame.height, t.elapsed()
+                    );
+                }
                 if output_tx.blocking_send(frame).is_err() {
+                    warn!("videodec: output channel closed at decoded frame #{decoded_count}");
                     break;
                 }
                 trace!(t=?t.elapsed(), "videodec: tx");
+            }
+            if pkt_count <= 3 || pkt_count % 100 == 0 {
+                info!("videodec: processed packet #{pkt_count}, total decoded frames: {decoded_count}");
             }
         }
         Ok(())
