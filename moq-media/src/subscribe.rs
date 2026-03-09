@@ -690,9 +690,10 @@ impl WatchTrack {
             while let Some(frame) = decoder.pop_frame().context("failed to pop frame")? {
                 decoded_count += 1;
                 if decoded_count <= 3 || decoded_count % 100 == 0 {
+                    let img = frame.img();
                     info!(
                         "videodec: decoded frame #{decoded_count} (from {pkt_count} packets), {}x{}, elapsed={:?}",
-                        frame.width, frame.height, t.elapsed()
+                        img.width(), img.height(), t.elapsed()
                     );
                 }
                 if output_tx.blocking_send(frame).is_err() {
