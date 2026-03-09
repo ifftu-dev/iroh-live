@@ -87,8 +87,35 @@ impl VideoDecoder for FfmpegVideoDecoder {
             // First, flatten payload into an ffmpeg packet (contiguous bytes)
             let raw_packet = packet.payload.to_ffmpeg_packet();
             let avcc_data = raw_packet.data().unwrap_or(&[]);
+
+            // Log first few bytes for debugging
+            let hex_preview: String = avcc_data
+                .iter()
+                .take(32)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!(
+                "ffmpeg decoder: AVCC input {} bytes, first 32: [{}]",
+                avcc_data.len(),
+                hex_preview
+            );
+
             // Convert AVCC (4-byte length-prefixed NALs) to Annex B (start-code NALs)
             let annexb = avcc_to_annexb(avcc_data);
+
+            let annexb_preview: String = annexb
+                .iter()
+                .take(32)
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!(
+                "ffmpeg decoder: Annex B output {} bytes, first 32: [{}]",
+                annexb.len(),
+                annexb_preview
+            );
+
             let mut ffmpeg_packet = ffmpeg::Packet::new(annexb.len());
             ffmpeg_packet.data_mut().unwrap().copy_from_slice(&annexb);
             self.codec
