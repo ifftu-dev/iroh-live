@@ -18,6 +18,8 @@ pub struct FfmpegVideoDecoder {
     decoded: FfmpegFrame,
     viewport_changed: Option<(u32, u32)>,
     last_timestamp: Option<hang::Timestamp>,
+    /// True when no avcC extradata was set — packets need AVCC-to-Annex B conversion
+    needs_avcc_to_annexb: bool,
 }
 
 impl VideoDecoder for FfmpegVideoDecoder {
@@ -32,6 +34,7 @@ impl VideoDecoder for FfmpegVideoDecoder {
         ffmpeg::init()?;
 
         // Build a decoder context for H.264 and attach extradata (e.g., avcC)
+        let has_extradata = config.description.is_some();
         let codec = match &config.codec {
             hang::catalog::VideoCodec::H264(_meta) => {
                 let codec =
@@ -55,6 +58,12 @@ impl VideoDecoder for FfmpegVideoDecoder {
                 config.codec
             ),
         };
+        let needs_avcc_to_annexb = !has_extradata;
+        if needs_avcc_to_annexb {
+            tracing::warn!(
+                "ffmpeg decoder: no extradata/avcC — will convert AVCC packets to Annex B"
+            );
+        }
         let rescaler = Rescaler::new(playback_config.pixel_format.to_ffmpeg(), None)?;
         let clock = StreamClock::default();
         let decoded = FfmpegFrame::empty();
@@ -65,6 +74,7 @@ impl VideoDecoder for FfmpegVideoDecoder {
             decoded,
             viewport_changed: None,
             last_timestamp: None,
+            needs_avcc_to_annexb,
         })
     }
 
@@ -73,8 +83,21 @@ impl VideoDecoder for FfmpegVideoDecoder {
     }
 
     fn push_packet(&mut self, packet: hang::Frame) -> Result<()> {
-        let ffmpeg_packet = packet.payload.to_ffmpeg_packet();
-        self.codec.send_packet(&ffmpeg_packet)?;
+        if self.needs_avcc_to_annexb {
+            // First, flatten payload into an ffmpeg packet (contiguous bytes)
+            let raw_packet = packet.payload.to_ffmpeg_packet();
+            let avcc_data = raw_packet.data().unwrap_or(&[]);
+            // Convert AVCC (4-byte length-prefixed NALs) to Annex B (start-code NALs)
+            let annexb = avcc_to_annexb(avcc_data);
+            let mut ffmpeg_packet = ffmpeg::Packet::new(annexb.len());
+            ffmpeg_packet.data_mut().unwrap().copy_from_slice(&annexb);
+            self.codec
+                .send_packet(&ffmpeg_packet)
+                .context("ffmpeg decoder: failed to decode Annex B converted packet")?;
+        } else {
+            let ffmpeg_packet = packet.payload.to_ffmpeg_packet();
+            self.codec.send_packet(&ffmpeg_packet)?;
+        }
         self.last_timestamp = Some(packet.timestamp);
         Ok(())
     }
@@ -111,6 +134,30 @@ impl VideoDecoder for FfmpegVideoDecoder {
             }
         }
     }
+}
+
+/// Convert AVCC-format H.264 data (4-byte length-prefixed NAL units)
+/// to Annex B format (start-code-prefixed NAL units).
+///
+/// This is needed when the decoder has no avcC extradata (out-of-band SPS/PPS),
+/// which is the case when VideoToolbox encoder hasn't yet provided its
+/// codec description through the catalog.
+fn avcc_to_annexb(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 64);
+    let mut pos = 0;
+    while pos + 4 <= data.len() {
+        let nal_len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        if nal_len == 0 || pos + nal_len > data.len() {
+            break;
+        }
+        // Annex B start code
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        out.extend_from_slice(&data[pos..pos + nal_len]);
+        pos += nal_len;
+    }
+    out
 }
 
 /// Calculates the target frame size to fit into the requested bounds while preserving aspect ratio.
