@@ -19,7 +19,7 @@ use crate::{
     av::{AudioEncoder, AudioEncoderInner, AudioPreset, AudioSource},
     util::spawn_thread,
 };
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 use crate::{av::DecodeConfig, subscribe::WatchTrack};
 #[cfg(any(feature = "video", feature = "video-ios"))]
 use crate::av::{VideoEncoder, VideoEncoderInner, VideoPreset, VideoSource};
@@ -77,6 +77,9 @@ impl PublishBroadcast {
     }
 
     /// Create a local WatchTrack from the current video source, if present.
+    ///
+    /// On desktop (`feature = "video"`): uses ffmpeg Rescaler for format conversion.
+    /// On iOS (`feature = "video-ios"`): uses lightweight BGRA→RGBA conversion.
     #[cfg(feature = "video")]
     pub fn watch_local(&self, decode_config: DecodeConfig) -> Option<WatchTrack> {
         let (source, shutdown) = {
@@ -92,6 +95,26 @@ impl PublishBroadcast {
             shutdown,
             source,
             decode_config,
+        ))
+    }
+
+    /// Create a local WatchTrack from the current video source (iOS variant).
+    ///
+    /// Uses lightweight BGRA→RGBA conversion without ffmpeg dependency.
+    #[cfg(all(feature = "video-ios", not(feature = "video")))]
+    pub fn watch_local(&self, _decode_config: DecodeConfig) -> Option<WatchTrack> {
+        let (source, shutdown) = {
+            let state = self.state.lock().expect("poisoned");
+            let source = state
+                .available_video
+                .as_ref()
+                .map(|video| video.source.clone())?;
+            Some((source, state.shutdown_token.child_token()))
+        }?;
+        Some(WatchTrack::from_video_source_raw(
+            "local".to_string(),
+            shutdown,
+            source,
         ))
     }
 

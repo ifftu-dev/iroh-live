@@ -21,7 +21,7 @@ use crate::{
 };
 #[cfg(any(feature = "video", feature = "video-ios"))]
 use crate::av::{DecodeConfig, DecodedFrame, Decoders, PlaybackConfig, VideoDecoder};
-#[cfg(feature = "video")]
+#[cfg(any(feature = "video", feature = "video-ios"))]
 use crate::av::VideoSource;
 #[cfg(feature = "video")]
 use crate::ffmpeg::util::Rescaler;
@@ -578,6 +578,93 @@ impl WatchTrack {
                 if let Err(err) = source.stop() {
                     warn!("Video source failed to stop: {err:?}");
                     return;
+                }
+            }
+        });
+        let guard = WatchTrackGuard {
+            _shutdown_token_guard: shutdown.drop_guard(),
+            _task_handle: None,
+            _thread_handle: Some(thread),
+        };
+        WatchTrack {
+            video_frames: WatchTrackFrames { rx: frame_rx },
+            handle: WatchTrackHandle {
+                rendition,
+                viewport,
+                _guard: guard,
+            },
+        }
+    }
+
+    /// Local video preview for iOS — no ffmpeg dependency.
+    ///
+    /// Converts raw camera frames (BGRA) to RGBA directly, without
+    /// ffmpeg's Rescaler. Suitable for self-preview where the camera
+    /// resolution is already appropriate (640×480 from AVCaptureSession).
+    #[cfg(feature = "video-ios")]
+    pub fn from_video_source_raw(
+        rendition: String,
+        shutdown: CancellationToken,
+        mut source: impl VideoSource,
+    ) -> Self {
+        use crate::av::PixelFormat;
+
+        let viewport = Watchable::new((1u32, 1u32));
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<DecodedFrame>(2);
+        let thread_name = format!("vpr-{:>4}-{:>4}", source.name(), rendition);
+        let thread = spawn_thread(thread_name, {
+            let shutdown = shutdown.clone();
+            move || {
+                let fps = 24;
+                let frame_duration = Duration::from_secs_f32(1. / fps as f32);
+                if let Err(err) = source.start() {
+                    warn!("Video source failed to start: {err:?}");
+                    return;
+                }
+                let start = std::time::Instant::now();
+                for i in 1u64.. {
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
+                    match source.pop_frame() {
+                        Ok(Some(frame)) => {
+                            let [w, h] = frame.format.dimensions;
+                            let raw = &frame.raw;
+
+                            // Convert BGRA → RGBA if needed (swap B and R channels)
+                            let rgba_data = match frame.format.pixel_format {
+                                PixelFormat::Bgra => {
+                                    let mut rgba = Vec::with_capacity(raw.len());
+                                    for chunk in raw.chunks_exact(4) {
+                                        rgba.push(chunk[2]); // R (was B)
+                                        rgba.push(chunk[1]); // G
+                                        rgba.push(chunk[0]); // B (was R)
+                                        rgba.push(chunk[3]); // A
+                                    }
+                                    rgba
+                                }
+                                PixelFormat::Rgba => raw.to_vec(),
+                            };
+
+                            if let Some(img) = image::RgbaImage::from_raw(w, h, rgba_data) {
+                                let decoded = DecodedFrame {
+                                    frame: image::Frame::new(img),
+                                    timestamp: start.elapsed(),
+                                };
+                                let _ = frame_tx.blocking_send(decoded);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => break,
+                    }
+                    let expected_time = frame_duration * i as u32;
+                    let actual_time = start.elapsed();
+                    if expected_time > actual_time {
+                        std::thread::sleep(expected_time - actual_time);
+                    }
+                }
+                if let Err(err) = source.stop() {
+                    warn!("Video source failed to stop: {err:?}");
                 }
             }
         });
