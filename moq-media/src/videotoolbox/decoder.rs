@@ -292,7 +292,7 @@ impl VideoDecoder for VtDecoder {
         }
 
         self.frame_count += 1;
-        if self.frame_count <= 3 || self.frame_count % 30 == 0 {
+        if self.frame_count <= 10 || self.frame_count % 100 == 0 {
             let preview: String = data
                 .iter()
                 .take(16)
@@ -372,8 +372,21 @@ impl VideoDecoder for VtDecoder {
         drop(data);
 
         if dec_status != 0 {
-            tracing::warn!("VTDecompressionSessionDecodeFrame failed: {dec_status}");
+            tracing::warn!(
+                "VTDecompressionSessionDecodeFrame failed: OSStatus={dec_status}, frame #{}",
+                self.frame_count
+            );
             // Don't bail — might be a recoverable error on a single frame
+        } else if self.frame_count <= 10 || self.frame_count % 100 == 0 {
+            // Check if the synchronous callback queued a frame
+            let queue_len = self.output.lock()
+                .map(|q| q.len())
+                .unwrap_or(999);
+            tracing::info!(
+                "VtDecoder: frame #{} decoded OK, output queue={}",
+                self.frame_count,
+                queue_len
+            );
         }
 
         Ok(())
@@ -385,7 +398,14 @@ impl VideoDecoder for VtDecoder {
                 .output
                 .lock()
                 .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-            q.pop_front()
+            let item = q.pop_front();
+            if item.is_some() {
+                let remaining = q.len();
+                if remaining == 0 || remaining % 100 == 0 {
+                    tracing::info!("VtDecoder::pop_frame: got frame, {} remaining in queue", remaining);
+                }
+            }
+            item
         };
 
         match raw {

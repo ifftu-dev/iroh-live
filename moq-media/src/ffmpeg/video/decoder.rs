@@ -20,6 +20,9 @@ pub struct FfmpegVideoDecoder {
     last_timestamp: Option<hang::Timestamp>,
     /// True when no avcC extradata was set — packets need AVCC-to-Annex B conversion
     needs_avcc_to_annexb: bool,
+    /// When needs_avcc_to_annexb is true, skip packets until we see the first keyframe
+    /// with SPS/PPS. Pre-keyframe non-IDR packets produce garbage without reference frames.
+    got_first_keyframe: bool,
 }
 
 impl VideoDecoder for FfmpegVideoDecoder {
@@ -75,6 +78,7 @@ impl VideoDecoder for FfmpegVideoDecoder {
             viewport_changed: None,
             last_timestamp: None,
             needs_avcc_to_annexb,
+            got_first_keyframe: false,
         })
     }
 
@@ -90,12 +94,35 @@ impl VideoDecoder for FfmpegVideoDecoder {
 
             // Log NAL unit types in the AVCC data for debugging
             let nal_types = parse_avcc_nal_types(avcc_data);
-            tracing::info!(
-                "ffmpeg decoder: AVCC input {} bytes, NAL types: {:?}, keyframe={}",
-                avcc_data.len(),
-                nal_types,
-                packet.keyframe,
-            );
+
+            // Skip non-keyframe packets before we get SPS/PPS from the first keyframe.
+            // Without parameter sets, the decoder produces garbage reference frames that
+            // corrupt all subsequent decoding.
+            if !self.got_first_keyframe {
+                let has_sps = nal_types.iter().any(|t| *t == "SPS");
+                if !has_sps {
+                    tracing::debug!(
+                        "ffmpeg decoder: skipping pre-keyframe packet ({} bytes, NAL types: {:?})",
+                        avcc_data.len(),
+                        nal_types,
+                    );
+                    return Ok(());
+                }
+                tracing::info!(
+                    "ffmpeg decoder: first keyframe received ({} bytes, NAL types: {:?})",
+                    avcc_data.len(),
+                    nal_types,
+                );
+                self.got_first_keyframe = true;
+            }
+
+            if packet.keyframe {
+                tracing::info!(
+                    "ffmpeg decoder: keyframe {} bytes, NAL types: {:?}",
+                    avcc_data.len(),
+                    nal_types,
+                );
+            }
 
             // Convert AVCC (4-byte length-prefixed NALs) to Annex B (start-code NALs)
             let annexb = avcc_to_annexb(avcc_data);
