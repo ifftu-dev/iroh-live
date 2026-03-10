@@ -639,6 +639,28 @@ unsafe extern "C" fn vt_output_callback(
         return;
     }
 
+    // For keyframes, prepend SPS+PPS as AVCC NAL units so the bitstream
+    // is self-contained. This allows decoders that missed the out-of-band
+    // avcC description (catalog race) to initialize from inline parameter sets.
+    if keyframe {
+        let fmt = CMSampleBufferGetFormatDescription(sample_buffer);
+        if !fmt.is_null() {
+            if let Some(sps_pps_nals) = extract_sps_pps_as_avcc_nals(fmt) {
+                let prefix_len = sps_pps_nals.len();
+                let mut combined = Vec::with_capacity(prefix_len + buf.len());
+                combined.extend_from_slice(&sps_pps_nals);
+                combined.extend_from_slice(&buf);
+                tracing::debug!(
+                    "VT encoder: prepended {} bytes SPS+PPS to keyframe ({} -> {} bytes)",
+                    prefix_len,
+                    data_len,
+                    combined.len()
+                );
+                buf = combined;
+            }
+        }
+    }
+
     // Get presentation timestamp
     let pts = CMSampleBufferGetPresentationTimeStamp(sample_buffer);
     let timestamp = if pts.flags & K_CM_TIME_FLAGS_VALID != 0 && pts.timescale > 0 {
@@ -677,6 +699,56 @@ unsafe fn is_keyframe(sbuf: CMSampleBufferRef) -> bool {
     } else {
         true
     }
+}
+
+/// Extract SPS and PPS from a CMFormatDescription and return them as
+/// AVCC-format NAL units (4-byte big-endian length prefix + NAL data).
+///
+/// This is prepended to keyframe packets so decoders can initialize from
+/// inline parameter sets, even without the out-of-band avcC description
+/// (which may be missing due to catalog race conditions).
+unsafe fn extract_sps_pps_as_avcc_nals(fmt: CMFormatDescriptionRef) -> Option<Vec<u8>> {
+    let mut sps_ptr: *const u8 = ptr::null();
+    let mut sps_size: usize = 0;
+    let mut param_count: usize = 0;
+    let mut nal_header_len: i32 = 0;
+
+    let status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+        fmt,
+        0,
+        &mut sps_ptr,
+        &mut sps_size,
+        &mut param_count,
+        &mut nal_header_len,
+    );
+    if status != 0 || sps_ptr.is_null() || sps_size == 0 {
+        return None;
+    }
+    let sps = std::slice::from_raw_parts(sps_ptr, sps_size);
+
+    let mut pps_ptr: *const u8 = ptr::null();
+    let mut pps_size: usize = 0;
+    let status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+        fmt,
+        1,
+        &mut pps_ptr,
+        &mut pps_size,
+        &mut param_count,
+        &mut nal_header_len,
+    );
+    if status != 0 || pps_ptr.is_null() || pps_size == 0 {
+        return None;
+    }
+    let pps = std::slice::from_raw_parts(pps_ptr, pps_size);
+
+    // Build AVCC NAL units: [4-byte big-endian length][NAL data] for each
+    let mut out = Vec::with_capacity(8 + sps_size + pps_size);
+    out.extend_from_slice(&(sps_size as u32).to_be_bytes());
+    out.extend_from_slice(sps);
+    out.extend_from_slice(&(pps_size as u32).to_be_bytes());
+    out.extend_from_slice(pps);
+
+    Some(out)
 }
 
 /// Extract avcC extradata (SPS + PPS) from a CMFormatDescription.

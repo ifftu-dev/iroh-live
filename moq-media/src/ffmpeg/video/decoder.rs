@@ -88,32 +88,21 @@ impl VideoDecoder for FfmpegVideoDecoder {
             let raw_packet = packet.payload.to_ffmpeg_packet();
             let avcc_data = raw_packet.data().unwrap_or(&[]);
 
-            // Log first few bytes for debugging
-            let hex_preview: String = avcc_data
-                .iter()
-                .take(32)
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
+            // Log NAL unit types in the AVCC data for debugging
+            let nal_types = parse_avcc_nal_types(avcc_data);
             tracing::info!(
-                "ffmpeg decoder: AVCC input {} bytes, first 32: [{}]",
+                "ffmpeg decoder: AVCC input {} bytes, NAL types: {:?}, keyframe={}",
                 avcc_data.len(),
-                hex_preview
+                nal_types,
+                packet.keyframe,
             );
 
             // Convert AVCC (4-byte length-prefixed NALs) to Annex B (start-code NALs)
             let annexb = avcc_to_annexb(avcc_data);
 
-            let annexb_preview: String = annexb
-                .iter()
-                .take(32)
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            tracing::info!(
-                "ffmpeg decoder: Annex B output {} bytes, first 32: [{}]",
+            tracing::debug!(
+                "ffmpeg decoder: Annex B output {} bytes",
                 annexb.len(),
-                annexb_preview
             );
 
             let mut ffmpeg_packet = ffmpeg::Packet::new(annexb.len());
@@ -161,6 +150,35 @@ impl VideoDecoder for FfmpegVideoDecoder {
             }
         }
     }
+}
+
+/// Parse AVCC-format data and return the NAL unit types present.
+/// Used for diagnostic logging to verify SPS/PPS presence.
+fn parse_avcc_nal_types(data: &[u8]) -> Vec<&'static str> {
+    let mut types = Vec::new();
+    let mut pos = 0;
+    while pos + 4 <= data.len() {
+        let nal_len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        if nal_len == 0 || pos + nal_len > data.len() {
+            break;
+        }
+        if nal_len > 0 {
+            let nal_type = data[pos] & 0x1F;
+            types.push(match nal_type {
+                1 => "non-IDR",
+                5 => "IDR",
+                6 => "SEI",
+                7 => "SPS",
+                8 => "PPS",
+                9 => "AUD",
+                _ => "other",
+            });
+        }
+        pos += nal_len;
+    }
+    types
 }
 
 /// Convert AVCC-format H.264 data (4-byte length-prefixed NAL units)
