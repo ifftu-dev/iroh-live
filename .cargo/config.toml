@@ -1,7 +1,10 @@
 [env]
-SDKROOT = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
-LLVM_CONFIG_PATH = "/opt/homebrew/opt/llvm/bin/llvm-config"
-BINDGEN_EXTRA_CLANG_ARGS = "-I/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include"
+# Default to Xcode SDK on macOS; CI can override by setting SDKROOT in the environment.
+SDKROOT = { value = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk", force = false }
+# Default to Homebrew LLVM on macOS; CI can override by setting LLVM_CONFIG_PATH.
+LLVM_CONFIG_PATH = { value = "/opt/homebrew/opt/llvm/bin/llvm-config", force = false }
+# Default clang args for macOS; CI can override by setting BINDGEN_EXTRA_CLANG_ARGS.
+BINDGEN_EXTRA_CLANG_ARGS = { value = "-I/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include", force = false }
 
 [target.aarch64-apple-darwin]
 rustflags = []
