@@ -1,3 +1,18 @@
+// Copyright 2025 N0, INC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
 //! Pure Opus encoder using `audiopus` (libopus binding, no ffmpeg).
 
 use anyhow::Result;
@@ -22,8 +37,13 @@ pub struct PureOpusEncoder {
     sample_rate: u32,
     bitrate: u64,
     channel_count: u32,
-    /// Buffer to accumulate encoded output.
+    /// Buffer used by the Opus encoder to write encoded output into.
+    /// Always kept at `MAX_PACKET_SIZE` capacity; the actual encoded
+    /// length from the last `push_samples` call is stored in `encoded_len`.
     encode_buf: Vec<u8>,
+    /// Number of valid encoded bytes in `encode_buf` after the last
+    /// `push_samples` call, or `None` if no data is ready to pop.
+    encoded_len: Option<usize>,
 }
 
 impl PureOpusEncoder {
@@ -95,6 +115,7 @@ impl PureOpusEncoder {
             channel_count,
             bitrate,
             encode_buf: vec![0u8; MAX_PACKET_SIZE],
+            encoded_len: None,
         })
     }
 }
@@ -143,6 +164,7 @@ impl AudioEncoderInner for PureOpusEncoder {
             FRAME_SIZE, samples_per_channel
         );
 
+        self.encode_buf.resize(MAX_PACKET_SIZE, 0);
         let encoded_len = self
             .encoder
             .encode_float(samples, &mut self.encode_buf)
@@ -154,32 +176,25 @@ impl AudioEncoderInner for PureOpusEncoder {
             encoded_len
         );
         self.sample_count += samples_per_channel as u64;
-
-        // Store the encoded length for pop_packet to use
-        // We use a simple approach: store at the end of encode_buf
-        // Actually, we need a separate field. Let's use a VecDeque approach.
-        // Simpler: since push_samples/pop_packet are called in a tight loop
-        // (push one frame, pop one packet), we can just store the last result.
-        self.encode_buf.truncate(encoded_len);
+        self.encoded_len = Some(encoded_len);
 
         Ok(())
     }
 
     fn pop_packet(&mut self) -> Result<Option<hang::Frame>> {
-        if self.encode_buf.is_empty() {
-            return Ok(None);
-        }
+        let len = match self.encoded_len.take() {
+            Some(l) => l,
+            None => return Ok(None),
+        };
 
-        let payload = self.encode_buf.clone();
-        // Reset buffer to full size for next encode
-        self.encode_buf.resize(MAX_PACKET_SIZE, 0);
+        let payload = self.encode_buf[..len].to_vec();
 
         let hang_frame = hang::Frame {
             payload: payload.into(),
             timestamp: Timestamp::from_micros(
                 (self.sample_count * 1_000_000) / self.sample_rate as u64,
             )?,
-            keyframe: true, // Audio frames are generally independent
+            keyframe: true,
         };
         trace!("pop_packet: {} bytes", hang_frame.payload.num_bytes());
         Ok(Some(hang_frame))

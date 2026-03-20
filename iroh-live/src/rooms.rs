@@ -1,10 +1,25 @@
-use std::collections::HashSet;
+// Copyright 2025 N0, INC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use iroh::{Endpoint, EndpointId, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_gossip::Gossip;
 use iroh_moq::MoqSession;
 use iroh_smol_kv::{ExpiryConfig, Filter, SignedValue, Subscribe, SubscribeMode, WriteScope};
@@ -15,7 +30,7 @@ use n0_future::FuturesUnordered;
 use n0_future::{StreamExt, task::AbortOnDropHandle};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{self, error::TryRecvError};
-use tracing::{Instrument, debug, error_span, warn};
+use tracing::{Instrument, debug, error_span, info, warn};
 
 use crate::Live;
 
@@ -57,6 +72,23 @@ impl RoomHandle {
             .await
             .map_err(|_| anyerr!("room actor died"))
     }
+
+    /// Force the room actor to remove a broadcast from active subscriptions and reconnect.
+    /// Call this when you detect a subscription has died (e.g., frame bridge ended)
+    /// but `broadcast.closed()` hasn't fired.
+    pub async fn force_resubscribe(
+        &self,
+        remote: EndpointId,
+        name: impl ToString,
+    ) -> Result<()> {
+        self.tx
+            .send(ApiMessage::ForceResubscribe {
+                remote,
+                name: name.to_string(),
+            })
+            .await
+            .map_err(|_| anyerr!("room actor died"))
+    }
 }
 
 impl Room {
@@ -72,6 +104,7 @@ impl Room {
 
         let actor = Actor::new(
             endpoint.secret_key(),
+            endpoint.clone(),
             live,
             event_tx,
             gossip,
@@ -120,6 +153,10 @@ enum ApiMessage {
         name: String,
         producer: BroadcastProducer,
     },
+    ForceResubscribe {
+        remote: EndpointId,
+        name: String,
+    },
 }
 
 pub enum RoomEvent {
@@ -151,13 +188,19 @@ struct BroadcastId(EndpointId, String);
 
 struct Actor {
     me: EndpointId,
+    endpoint: Endpoint,
     _gossip: Gossip,
     live: Live,
     active_subscribe: HashSet<BroadcastId>,
     active_publish: HashSet<String>,
+    known_remote_broadcasts: HashMap<EndpointId, Vec<String>>,
+    active_sessions: HashMap<BroadcastId, MoqSession>,
+    peer_addrs: HashMap<EndpointId, EndpointAddr>,
+    retry_counts: HashMap<BroadcastId, u32>,
     connecting:
         FuturesUnordered<BoxFuture<(BroadcastId, Result<(MoqSession, SubscribeBroadcast)>)>>,
     subscribe_closed: FuturesUnordered<BoxFuture<BroadcastId>>,
+    retry_timers: FuturesUnordered<BoxFuture<BroadcastId>>,
     publish_closed: FuturesUnordered<BoxFuture<String>>,
     event_tx: mpsc::Sender<RoomEvent>,
     kv: iroh_smol_kv::Client,
@@ -167,6 +210,7 @@ struct Actor {
 impl Actor {
     async fn new(
         me: &SecretKey,
+        endpoint: Endpoint,
         live: Live,
         event_tx: mpsc::Sender<RoomEvent>,
         gossip: Gossip,
@@ -189,12 +233,18 @@ impl Actor {
         let kv_writer = kv.write(me.clone());
         Ok(Self {
             me: me.public(),
+            endpoint,
             live,
             _gossip: gossip,
             active_subscribe: Default::default(),
             active_publish: Default::default(),
+            known_remote_broadcasts: Default::default(),
+            active_sessions: Default::default(),
+            peer_addrs: Default::default(),
+            retry_counts: Default::default(),
             connecting: Default::default(),
             subscribe_closed: Default::default(),
+            retry_timers: Default::default(),
             publish_closed: Default::default(),
             event_tx,
             kv,
@@ -211,6 +261,11 @@ impl Actor {
             })
             .stream();
         tokio::pin!(updates);
+
+        // Periodic reconciliation: every 15s, check if any known remote broadcasts
+        // are missing from active_subscribe and reconnect them.
+        let mut reconcile_interval = tokio::time::interval(Duration::from_secs(15));
+        reconcile_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -229,6 +284,17 @@ impl Actor {
                 Some((id, res)) = self.connecting.next(), if !self.connecting.is_empty() => {
                     match res {
                         Ok((session, broadcast)) => {
+                            let peer_id = session.remote_id();
+                            let mut peer_addr = EndpointAddr::from(peer_id);
+                            let our_addr = self.endpoint.addr();
+                            for a in &our_addr.addrs {
+                                if a.is_relay() {
+                                    peer_addr.addrs.insert(a.clone());
+                                }
+                            }
+                            self.peer_addrs.insert(peer_id, peer_addr);
+                            self.active_sessions.insert(id.clone(), session.clone());
+                            self.retry_counts.remove(&id);
                             let closed_fut = broadcast.closed();
                             self.event_tx.send(RoomEvent::BroadcastSubscribed { session, broadcast }).await.ok();
                             self.subscribe_closed.push(Box::pin(async move {
@@ -239,12 +305,24 @@ impl Actor {
                         Err(err) => {
                             self.active_subscribe.remove(&id);
                             warn!("Subscribing to broadcast {id} failed: {err:#}");
+                            self.schedule_retry(id);
                         }
                     }
                 }
                 Some(id) = self.subscribe_closed.next(), if !self.subscribe_closed.is_empty() => {
-                    debug!("broadcast closed: {id}");
                     self.active_subscribe.remove(&id);
+                    // Drop our reference but do NOT close the session — it is
+                    // shared bidirectionally (pub + sub) and closing it would
+                    // kill publishing tracks going the other direction, causing
+                    // a force_resubscribe cascade on the remote peer.
+                    self.active_sessions.remove(&id);
+                    self.schedule_retry(id);
+                }
+                Some(id) = self.retry_timers.next(), if !self.retry_timers.is_empty() => {
+                    self.handle_retry(id);
+                }
+                _ = reconcile_interval.tick() => {
+                    self.reconcile_subscriptions();
                 }
                 Some(name) = self.publish_closed.next(), if !self.publish_closed.is_empty() => {
                     self.active_publish.remove(&name);
@@ -266,6 +344,26 @@ impl Actor {
                 }));
                 self.update_kv().await;
             }
+            ApiMessage::ForceResubscribe { remote, name } => {
+                let id = BroadcastId(remote, name.clone());
+                info!("force_resubscribe: {id} — removing from active and reconnecting");
+                self.active_subscribe.remove(&id);
+                self.retry_counts.remove(&id);
+                // Don't close the session — it's shared bidirectionally.
+                // handle_connect will reuse it if healthy or create a new one.
+                self.active_sessions.remove(&id);
+                let still_known = self
+                    .known_remote_broadcasts
+                    .get(&remote)
+                    .map(|names| names.contains(&name))
+                    .unwrap_or(false);
+                if still_known {
+                    self.active_subscribe.insert(id.clone());
+                    self.start_connect_and_subscribe(id, remote, name);
+                } else {
+                    info!("force_resubscribe: {id} — peer no longer in known_remote_broadcasts, skipping");
+                }
+            }
         }
     }
 
@@ -278,55 +376,141 @@ impl Actor {
             return;
         };
         let PeerState { broadcasts } = value;
+        // Track known remote broadcasts for reconciliation.
+        self.known_remote_broadcasts
+            .insert(remote, broadcasts.clone());
         for name in broadcasts.clone() {
             let id = BroadcastId(remote, name.clone());
             if !self.active_subscribe.insert(id.clone()) {
                 continue;
             }
-            let live = self.live.clone();
-            self.connecting.push(Box::pin(async move {
-                tracing::info!(
-                    remote = %remote.fmt_short(),
-                    name = %name,
-                    "room: starting connect_and_subscribe"
-                );
-                let result = tokio::time::timeout(
-                    Duration::from_secs(30),
-                    live.connect_and_subscribe(remote, &name),
-                ).await;
-                let session = match result {
-                    Ok(inner) => {
-                        match &inner {
-                            Ok(_) => tracing::info!(
-                                remote = %remote.fmt_short(),
-                                name = %name,
-                                "room: connect_and_subscribe succeeded"
-                            ),
-                            Err(e) => tracing::warn!(
-                                remote = %remote.fmt_short(),
-                                name = %name,
-                                error = %e,
-                                "room: connect_and_subscribe failed"
-                            ),
-                        }
-                        inner
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            remote = %remote.fmt_short(),
-                            name = %name,
-                            "room: connect_and_subscribe timed out after 30s"
-                        );
-                        Err(n0_error::anyerr!("connect_and_subscribe timed out after 30s"))
-                    }
-                };
-                (id, session)
-            }));
+            self.start_connect_and_subscribe(id, remote, name);
         }
         self.event_tx
             .send(RoomEvent::RemoteAnnounced { remote, broadcasts })
             .await
             .ok();
+    }
+
+    /// Attempt to connect and subscribe to a broadcast.
+    fn start_connect_and_subscribe(
+        &mut self,
+        id: BroadcastId,
+        remote: EndpointId,
+        name: String,
+    ) {
+        let live = self.live.clone();
+        let addr = self.peer_addrs.get(&remote).cloned().unwrap_or_else(|| {
+            let mut addr = EndpointAddr::from(remote);
+            let our_addr = self.endpoint.addr();
+            for a in &our_addr.addrs {
+                if a.is_relay() {
+                    addr.addrs.insert(a.clone());
+                }
+            }
+            addr
+        });
+        self.connecting.push(Box::pin(async move {
+            info!(
+                remote = %remote.fmt_short(),
+                name = %name,
+                addrs = addr.addrs.len(),
+                "room: starting connect_and_subscribe"
+            );
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                live.connect_and_subscribe(addr, &name),
+            )
+            .await;
+            let session = match result {
+                Ok(inner) => {
+                    match &inner {
+                        Ok(_) => info!(
+                            remote = %remote.fmt_short(),
+                            name = %name,
+                            "room: connect_and_subscribe succeeded"
+                        ),
+                        Err(e) => warn!(
+                            remote = %remote.fmt_short(),
+                            name = %name,
+                            error = %e,
+                            "room: connect_and_subscribe failed"
+                        ),
+                    }
+                    inner
+                }
+                Err(_) => {
+                    warn!(
+                        remote = %remote.fmt_short(),
+                        name = %name,
+                        "room: connect_and_subscribe timed out after 10s"
+                    );
+                    Err(n0_error::anyerr!("connect_and_subscribe timed out after 10s"))
+                }
+            };
+            (id, session)
+        }));
+    }
+
+    fn schedule_retry(&mut self, id: BroadcastId) {
+        let count = self.retry_counts.entry(id.clone()).or_insert(0);
+        *count += 1;
+        // 2s, 4s, 8s, 16s, 30s cap
+        let delay_secs = std::cmp::min(2u64.saturating_pow(*count), 30);
+        info!("scheduling retry #{} for {id} in {delay_secs}s", *count);
+        let retry_id = id;
+        self.retry_timers.push(Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+            retry_id
+        }));
+    }
+
+    fn handle_retry(&mut self, id: BroadcastId) {
+        let still_known = self
+            .known_remote_broadcasts
+            .get(&id.0)
+            .map(|names| names.contains(&id.1))
+            .unwrap_or(false);
+
+        if !still_known {
+            info!("retry: {id} — peer no longer broadcasting, skipping");
+            self.retry_counts.remove(&id);
+            return;
+        }
+
+        if self.active_subscribe.contains(&id) {
+            debug!("retry: {id} — already active, skipping");
+            return;
+        }
+
+        let attempt = self.retry_counts.get(&id).copied().unwrap_or(0);
+        info!("retry: {id} — attempt #{attempt}, reconnecting");
+        self.active_subscribe.insert(id.clone());
+        let remote = id.0;
+        let name = id.1.clone();
+        self.start_connect_and_subscribe(id, remote, name);
+    }
+
+    /// Periodic reconciliation: reconnect any known broadcasts that are not actively subscribed.
+    fn reconcile_subscriptions(&mut self) {
+        // Collect missing subscriptions first to avoid borrow conflict.
+        let active = &self.active_subscribe;
+        let mut missing = Vec::new();
+        for (remote, names) in &self.known_remote_broadcasts {
+            for name in names {
+                let id = BroadcastId(*remote, name.clone());
+                if !active.contains(&id) {
+                    missing.push((*remote, name.clone()));
+                }
+            }
+        }
+
+        for (remote, name) in missing {
+            let id = BroadcastId(remote, name.clone());
+            info!("reconcile: {id} — not active, reconnecting");
+            self.active_subscribe.insert(id.clone());
+            self.start_connect_and_subscribe(id, remote, name);
+        }
     }
 
     async fn update_kv(&self) {

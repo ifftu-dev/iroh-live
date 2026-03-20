@@ -1,3 +1,18 @@
+// Copyright 2025 N0, INC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
 use std::{
     collections::{HashMap, hash_map},
     sync::Arc,
@@ -424,8 +439,17 @@ impl Actor {
     ) {
         let remote_id = remote.id;
         if let Some(session) = self.sessions.get(&remote_id) {
-            reply.send(Ok(session.clone())).ok();
-            return;
+            // Check if the cached session's QUIC connection is still alive.
+            // A connection can die (path failure, idle timeout) without the
+            // session_tasks future having fired yet. Reusing a dead session
+            // causes "Broadcast closed before receiving catalog" errors.
+            if session.conn().close_reason().is_none() {
+                reply.send(Ok(session.clone())).ok();
+                return;
+            }
+            // Connection is dead — evict and establish a new one.
+            info!(remote=%remote_id.fmt_short(), "cached session has dead connection, evicting and reconnecting");
+            self.sessions.remove(&remote_id);
         }
         match self.pending_connects.entry(remote_id) {
             hash_map::Entry::Occupied(mut entry) => {

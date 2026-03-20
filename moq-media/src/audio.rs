@@ -1,3 +1,18 @@
+// Copyright 2025 N0, INC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
 use std::{
     collections::HashMap,
     sync::{
@@ -535,6 +550,9 @@ impl AudioDriver {
                 sample_rate.try_into().unwrap(),
                 output_stream_sample_rate,
                 ResamplingChannelConfig {
+                    // Increase latency buffer for network-jittered audio (P2P conferencing).
+                    // Default 150ms is too small; 500ms matches fixed_resample's network_chat example.
+                    latency_seconds: 0.5,
                     capacity_seconds: 3.,
                     ..Default::default()
                 },

@@ -1,3 +1,18 @@
+// Copyright 2025 N0, INC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
 //! VideoToolbox H.264 encoder for iOS.
 //!
 //! Uses `VTCompressionSession` to encode BGRA `VideoFrame`s into H.264
@@ -455,14 +470,16 @@ impl VideoEncoder for VtEncoder {
     fn with_preset(preset: VideoPreset) -> Result<Self> {
         let (w, h) = preset.dimensions();
         let fps = preset.fps() as f64;
-        // Bitrate: scale with resolution
         let bitrate = match preset {
             VideoPreset::P180 => 300_000,
             VideoPreset::P360 => 800_000,
             VideoPreset::P720 => 2_500_000,
             VideoPreset::P1080 => 5_000_000,
         };
-        Self::create(w, h, fps, bitrate)
+        // VtEncoder only runs on iOS phones which use portrait camera
+        // orientation (480×640).  Swap preset dimensions so the session
+        // matches the portrait aspect ratio (e.g. P180 → 180×320).
+        Self::create(h, w, fps, bitrate)
     }
 }
 
@@ -485,20 +502,23 @@ impl VideoEncoderInner for VtEncoder {
     }
 
     fn push_frame(&mut self, frame: VideoFrame) -> Result<()> {
-        let expected_len = (self.width * self.height * 4) as usize;
+        // VTCompressionSession auto-scales input to the session's configured size,
+        // so CVPixelBuffer must use the frame's actual dimensions, not the encoder's.
+        let frame_width = frame.format.dimensions[0] as usize;
+        let frame_height = frame.format.dimensions[1] as usize;
+        let bytes_per_row = frame_width * 4;
+        let expected_len = bytes_per_row * frame_height;
         if frame.raw.len() < expected_len {
             bail!(
                 "frame too small: {} bytes, expected {} ({}x{}x4)",
                 frame.raw.len(),
                 expected_len,
-                self.width,
-                self.height,
+                frame_width,
+                frame_height,
             );
         }
 
-        // Create CVPixelBuffer from raw bytes
         let mut pixel_buffer: CVPixelBufferRef = ptr::null();
-        let bytes_per_row = self.width as usize * 4;
 
         // We need a mutable copy because CVPixelBufferCreateWithBytes wants *mut
         let mut raw_copy = frame.raw.to_vec();
@@ -506,8 +526,8 @@ impl VideoEncoderInner for VtEncoder {
         let status = unsafe {
             CVPixelBufferCreateWithBytes(
                 kCFAllocatorDefault,
-                self.width as usize,
-                self.height as usize,
+                frame_width,
+                frame_height,
                 K_CV_PIXEL_FORMAT_TYPE_32_BGRA,
                 raw_copy.as_mut_ptr() as *mut c_void,
                 bytes_per_row,

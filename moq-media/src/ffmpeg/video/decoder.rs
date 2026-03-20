@@ -1,3 +1,18 @@
+// Copyright 2025 N0, INC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
 use anyhow::{Context, Result};
 use ffmpeg_next::{
     self as ffmpeg, codec, codec::Id as CodecId, util::frame::video::Video as FfmpegFrame,
@@ -127,10 +142,7 @@ impl VideoDecoder for FfmpegVideoDecoder {
             // Convert AVCC (4-byte length-prefixed NALs) to Annex B (start-code NALs)
             let annexb = avcc_to_annexb(avcc_data);
 
-            tracing::debug!(
-                "ffmpeg decoder: Annex B output {} bytes",
-                annexb.len(),
-            );
+            tracing::debug!("ffmpeg decoder: Annex B output {} bytes", annexb.len(),);
 
             let mut ffmpeg_packet = ffmpeg::Packet::new(annexb.len());
             ffmpeg_packet.data_mut().unwrap().copy_from_slice(&annexb);
@@ -146,10 +158,27 @@ impl VideoDecoder for FfmpegVideoDecoder {
     }
 
     fn pop_frame(&mut self) -> Result<Option<av::DecodedFrame>> {
-        // Pull all available decoded frames
         match self.codec.receive_frame(&mut self.decoded) {
             Ok(()) => {
-                // Apply clamped target size.
+                if self.viewport_changed.is_some() || self.rescaler.ctx.is_none() {
+                    tracing::info!(
+                        "ffmpeg decoder: raw={}x{} fmt={:?} stride={}, target={}x{} fmt={:?}",
+                        self.decoded.width(),
+                        self.decoded.height(),
+                        self.decoded.format(),
+                        self.decoded.stride(0),
+                        self.rescaler
+                            .target_width_height
+                            .map(|(w, _)| w)
+                            .unwrap_or(0),
+                        self.rescaler
+                            .target_width_height
+                            .map(|(_, h)| h)
+                            .unwrap_or(0),
+                        self.rescaler.target_format,
+                    );
+                }
+
                 if let Some((max_width, max_height)) = self.viewport_changed.take() {
                     let (width, height) =
                         calculate_resized_size(&self.decoded, max_width, max_height);

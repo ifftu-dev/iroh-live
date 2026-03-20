@@ -1,3 +1,18 @@
+// Copyright 2025 N0, INC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
 //! iOS camera capture using AVFoundation (AVCaptureSession).
 //!
 //! Implements the `VideoSource` trait by capturing BGRA frames from the
@@ -445,16 +460,28 @@ impl IosCameraSource {
         }
         msg_send_1id(session, b"addOutput:\0", output);
 
+        // Rotate output to portrait so frames are upright when phone is
+        // held vertically.  Changes output from 640×480 → 480×640.
+        let media_type_video = load_framework_nsstring(b"AVMediaTypeVideo\0");
+        if !media_type_video.is_null() {
+            let connection: Id =
+                msg_send_1id(output, b"connectionWithMediaType:\0", media_type_video);
+            if !connection.is_null() {
+                // AVCaptureVideoOrientationPortrait = 1
+                msg_send_1int(connection, b"setVideoOrientation:\0", 1);
+                tracing::info!("iOS camera: set videoOrientation = portrait");
+            }
+        }
+
         // We can release output — session retains it
         release(output);
-
         Ok(IosCameraSource {
             session,
             delegate,
             rx,
             sender_ptr,
-            width: 640,
-            height: 480,
+            width: 480,
+            height: 640,
             running: false,
         })
     }

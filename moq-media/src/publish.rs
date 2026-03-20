@@ -1,3 +1,18 @@
+// Copyright 2025 N0, INC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
@@ -163,7 +178,9 @@ impl PublishBroadcast {
                     let mut catalog = self.catalog.lock();
                     catalog.audio = Some(audio);
                 }
-                self.state.lock().expect("poisoned").available_audio = Some(renditions);
+                let mut state = self.state.lock().expect("poisoned");
+                state.audio_muted.store(false, Ordering::Relaxed);
+                state.available_audio = Some(renditions);
             }
             None => {
                 // Clear catalog and stop any active audio encoders
@@ -175,6 +192,14 @@ impl PublishBroadcast {
             }
         }
         Ok(())
+    }
+
+    pub fn set_audio_muted(&self, muted: bool) {
+        self.state
+            .lock()
+            .expect("poisoned")
+            .audio_muted
+            .store(muted, Ordering::Relaxed);
     }
 }
 
@@ -191,6 +216,7 @@ struct State {
     #[cfg(any(feature = "video", feature = "video-ios"))]
     available_video: Option<VideoRenditions>,
     available_audio: Option<AudioRenditions>,
+    audio_muted: Arc<AtomicBool>,
     #[cfg(any(feature = "video", feature = "video-ios"))]
     active_video: HashMap<String, EncoderThread>,
     active_audio: HashMap<String, EncoderThread>,
@@ -240,7 +266,7 @@ impl State {
         if let Some(audio) = self.available_audio.as_mut()
             && audio.contains_rendition(&name)
         {
-            let thread = audio.start_encoder(&name, track, shutdown_token)?;
+            let thread = audio.start_encoder(&name, track, shutdown_token, self.audio_muted.clone())?;
             self.active_audio.insert(name, thread);
             Ok(())
         } else {
@@ -298,6 +324,7 @@ impl AudioRenditions {
         name: &str,
         producer: hang::TrackProducer,
         shutdown_token: CancellationToken,
+        muted: Arc<AtomicBool>,
     ) -> Result<EncoderThread> {
         let preset = self
             .renditions
@@ -309,6 +336,7 @@ impl AudioRenditions {
             encoder,
             producer,
             shutdown_token,
+            muted,
         );
         Ok(thread)
     }
@@ -572,6 +600,7 @@ impl EncoderThread {
         mut encoder: impl AudioEncoderInner,
         mut producer: hang::TrackProducer,
         shutdown: CancellationToken,
+        muted: Arc<AtomicBool>,
     ) -> Self {
         let sd = shutdown.clone();
         let name = encoder.name();
@@ -594,38 +623,45 @@ impl EncoderThread {
                 if shutdown.is_cancelled() {
                     break;
                 }
-                match source.pop_samples(&mut buf) {
-                    Ok(Some(_n)) => {
-                        // Expect a full frame; if shorter, zero-pad via slice len
-                        if let Err(err) = encoder.push_samples(&buf) {
-                            error!(buf_len = buf.len(), "audio push_samples failed: {err:#}");
+                let have_samples = if muted.load(Ordering::Relaxed) {
+                    buf.fill(0.0);
+                    true
+                } else {
+                    match source.pop_samples(&mut buf) {
+                        Ok(Some(_n)) => true,
+                        Ok(None) => {
+                            audio_none_count += 1;
+                            if audio_none_count == 1 || audio_none_count == 50 || audio_none_count % 500 == 0 {
+                                warn!("audioenc: source returned None ({audio_none_count} times)");
+                            }
+                            false
+                        }
+                        Err(err) => {
+                            error!("audio source failed: {err:#}");
                             break;
                         }
-                        while let Ok(Some(pkt)) = encoder
-                            .pop_packet()
-                            .inspect_err(|err| warn!("encoder error: {err:#}"))
-                        {
-                            audio_pkt_count += 1;
-                            if audio_pkt_count <= 3 || audio_pkt_count % 500 == 0 {
-                                info!(
-                                    "audioenc: packet #{audio_pkt_count}, bytes={}",
-                                    pkt.payload.num_bytes()
-                                );
-                            }
-                            if let Err(err) = producer.write(pkt) {
-                                warn!("failed to write frame to producer: {err:#}");
-                            }
-                        }
                     }
-                    Ok(None) => {
-                        audio_none_count += 1;
-                        if audio_none_count == 1 || audio_none_count == 50 || audio_none_count % 500 == 0 {
-                            warn!("audioenc: source returned None ({audio_none_count} times)");
-                        }
-                    }
-                    Err(err) => {
-                        error!("audio source failed: {err:#}");
+                };
+                if have_samples {
+                    // Expect a full frame; if shorter, zero-pad via slice len
+                    if let Err(err) = encoder.push_samples(&buf) {
+                        error!(buf_len = buf.len(), "audio push_samples failed: {err:#}");
                         break;
+                    }
+                    while let Ok(Some(pkt)) = encoder
+                        .pop_packet()
+                        .inspect_err(|err| warn!("encoder error: {err:#}"))
+                    {
+                        audio_pkt_count += 1;
+                        if audio_pkt_count <= 3 || audio_pkt_count % 500 == 0 {
+                            info!(
+                                "audioenc: packet #{audio_pkt_count}, bytes={}",
+                                pkt.payload.num_bytes()
+                            );
+                        }
+                        if let Err(err) = producer.write(pkt) {
+                            warn!("failed to write frame to producer: {err:#}");
+                        }
                     }
                 }
                 let expected_time = (tick + 1) * INTERVAL;

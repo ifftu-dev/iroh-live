@@ -1,3 +1,18 @@
+// Copyright 2025 N0, INC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
 //! VideoToolbox H.264 decoder for iOS.
 //!
 //! Uses `VTDecompressionSession` to decode H.264 length-prefixed NAL units
@@ -154,6 +169,10 @@ struct RawDecodedFrame {
 }
 
 /// VideoToolbox H.264 decoder for iOS.
+///
+/// Supports two initialization modes:
+/// - **Eager**: description (avcC) is available in the catalog → session created immediately.
+/// - **Deferred**: description is missing → session created on first keyframe using inline SPS/PPS.
 pub struct VtDecoder {
     session: VTDecompressionSessionRef,
     format_desc: CMFormatDescriptionRef,
@@ -161,6 +180,7 @@ pub struct VtDecoder {
     viewport_w: u32,
     viewport_h: u32,
     frame_count: u64,
+    initialized: bool,
 }
 
 unsafe impl Send for VtDecoder {}
@@ -183,97 +203,39 @@ impl Drop for VtDecoder {
 
 impl VideoDecoder for VtDecoder {
     fn new(config: &hang::catalog::VideoConfig, _playback_config: &DecodeConfig) -> Result<Self> {
-        let desc_bytes = config
-            .description
-            .as_ref()
-            .context("VideoConfig.description (avcC) is required for H.264 decoding")?;
+        let viewport_w = config.coded_width.unwrap_or(640);
+        let viewport_h = config.coded_height.unwrap_or(480);
 
-        // Parse avcC to extract SPS and PPS
-        let (sps, pps) = parse_avcc(desc_bytes)?;
-
-        // Create CMFormatDescription from SPS+PPS
-        let param_sets: [*const u8; 2] = [sps.as_ptr(), pps.as_ptr()];
-        let param_sizes: [usize; 2] = [sps.len(), pps.len()];
-        let mut format_desc: CMFormatDescriptionRef = ptr::null();
-
-        let status = unsafe {
-            CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                kCFAllocatorDefault,
-                2,
-                param_sets.as_ptr(),
-                param_sizes.as_ptr(),
-                4, // 4-byte length-prefixed NALUs
-                &mut format_desc,
-            )
-        };
-        if status != 0 || format_desc.is_null() {
-            bail!("CMVideoFormatDescriptionCreateFromH264ParameterSets failed: {status}");
-        }
-
-        // Destination pixel buffer attributes: BGRA (we'll convert to RGBA in software)
-        let dest_attrs = unsafe {
-            let dict = CFDictionaryCreateMutable(
-                kCFAllocatorDefault,
-                1,
-                &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
-                &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
-            );
-            let fmt = K_CV_PIXEL_FORMAT_TYPE_32_BGRA as i32;
-            let fmt_num = CFNumberCreate(
-                kCFAllocatorDefault,
-                K_CF_NUMBER_SINT32_TYPE,
-                &fmt as *const _ as *const c_void,
-            );
-            CFDictionarySetValue(dict, kCVPixelBufferPixelFormatTypeKey as _, fmt_num as _);
-            CFRelease(fmt_num as _);
-            dict
-        };
-
-        let output = Arc::new(Mutex::new(VecDeque::<RawDecodedFrame>::new()));
-        let output_ptr = Arc::into_raw(output.clone()) as *mut c_void;
-
-        let callback = VTDecompressionOutputCallbackRecord {
-            decompress_output_callback: vt_decompress_callback,
-            decompress_output_ref_con: output_ptr,
-        };
-
-        let mut session: VTDecompressionSessionRef = ptr::null_mut();
-        let status = unsafe {
-            VTDecompressionSessionCreate(
-                kCFAllocatorDefault,
-                format_desc,
-                ptr::null(),     // decoder specification
-                dest_attrs as _, // destination attributes
-                &callback,
-                &mut session,
-            )
-        };
-
-        unsafe { CFRelease(dest_attrs as _) };
-
-        if status != 0 || session.is_null() {
-            unsafe {
-                CFRelease(format_desc as _);
-                Arc::from_raw(output_ptr as *const Mutex<VecDeque<RawDecodedFrame>>);
+        match config.description.as_ref() {
+            Some(desc_bytes) => match Self::create_session(desc_bytes) {
+                Ok((session, format_desc, output)) => {
+                    tracing::info!(
+                        "VtDecoder created (eager): session={session:?}, {viewport_w}x{viewport_h}"
+                    );
+                    Ok(Self {
+                        session,
+                        format_desc,
+                        output,
+                        viewport_w,
+                        viewport_h,
+                        frame_count: 0,
+                        initialized: true,
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(
+                            "VtDecoder: description present but init failed: {e:#}, deferring to first keyframe"
+                        );
+                    Ok(Self::uninit(viewport_w, viewport_h))
+                }
+            },
+            None => {
+                tracing::info!(
+                    "VtDecoder: no description in catalog, deferring init to first keyframe"
+                );
+                Ok(Self::uninit(viewport_w, viewport_h))
             }
-            bail!("VTDecompressionSessionCreate failed: {status}");
         }
-
-        tracing::info!(
-            "VtDecoder created: session={:?}, {}x{}",
-            session,
-            config.coded_width.unwrap_or(640),
-            config.coded_height.unwrap_or(480)
-        );
-
-        Ok(Self {
-            session,
-            format_desc,
-            output,
-            viewport_w: config.coded_width.unwrap_or(640),
-            viewport_h: config.coded_height.unwrap_or(480),
-            frame_count: 0,
-        })
     }
 
     fn name(&self) -> &str {
@@ -281,19 +243,81 @@ impl VideoDecoder for VtDecoder {
     }
 
     fn push_packet(&mut self, packet: hang::Frame) -> Result<()> {
-        // Collect payload bytes
-        let data: Vec<u8> = packet
+        if !self.initialized {
+            if !packet.keyframe {
+                return Ok(());
+            }
+            let raw_data: Vec<u8> = packet
+                .payload
+                .iter()
+                .flat_map(|b| b.iter().copied())
+                .collect();
+            if raw_data.is_empty() {
+                return Ok(());
+            }
+            tracing::info!(
+                "VtDecoder: deferred init got first keyframe ({} bytes)",
+                raw_data.len(),
+            );
+            let parse_result = if is_annex_b(&raw_data) {
+                tracing::info!("VtDecoder: deferred init keyframe appears to be Annex B");
+                parse_annex_b(&raw_data)
+            } else {
+                tracing::info!("VtDecoder: deferred init keyframe appears to be AVCC");
+                self.try_extract_sps_pps_from_avcc(&raw_data)
+            };
+            let (sps, pps) = parse_result
+                .map(|(sps, pps)| {
+                    tracing::info!(
+                        "VtDecoder: deferred init parsed SPS/PPS successfully (sps={}B, pps={}B)",
+                        sps.len(),
+                        pps.len()
+                    );
+                    (sps, pps)
+                })
+                .inspect_err(|e| {
+                    tracing::warn!("VtDecoder: deferred init SPS/PPS parse failed: {e:#}");
+                })?;
+            let mut avcc = Vec::with_capacity(11 + sps.len() + pps.len());
+            avcc.push(1); // version
+            avcc.push(sps.get(1).copied().unwrap_or(0x42)); // profile
+            avcc.push(sps.get(2).copied().unwrap_or(0xE0)); // compat
+            avcc.push(sps.get(3).copied().unwrap_or(0x1F)); // level
+            avcc.push(0xFF); // 4-byte NALU length
+            avcc.push(0xE1); // 1 SPS
+            avcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+            avcc.extend_from_slice(&sps);
+            avcc.push(1); // 1 PPS
+            avcc.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+            avcc.extend_from_slice(&pps);
+
+            match Self::create_session(&avcc) {
+                Ok((session, format_desc, output)) => {
+                    tracing::info!("VtDecoder: deferred init succeeded, session={session:?}");
+                    self.session = session;
+                    self.format_desc = format_desc;
+                    self.output = output;
+                    self.initialized = true;
+                }
+                Err(e) => {
+                    tracing::warn!("VtDecoder: deferred init failed: {e:#}");
+                    return Ok(());
+                }
+            }
+        }
+
+        let raw_data: Vec<u8> = packet
             .payload
             .iter()
             .flat_map(|b| b.iter().copied())
             .collect();
-        if data.is_empty() {
+        if raw_data.is_empty() {
             return Ok(());
         }
 
         self.frame_count += 1;
         if self.frame_count <= 10 || self.frame_count % 100 == 0 {
-            let preview: String = data
+            let preview: String = raw_data
                 .iter()
                 .take(16)
                 .map(|b| format!("{b:02x}"))
@@ -302,10 +326,27 @@ impl VideoDecoder for VtDecoder {
             tracing::info!(
                 "VtDecoder::push_packet #{}: {} bytes, keyframe={}, first 16: {preview}",
                 self.frame_count,
-                data.len(),
+                raw_data.len(),
                 packet.keyframe
             );
         }
+
+        // Detect whether the data uses Annex B start codes (00 00 00 01 or 00 00 01)
+        // or is already length-prefixed (4-byte big-endian length + NAL data).
+        // VTDecompressionSession requires length-prefixed NALUs.
+        let data = if is_annex_b(&raw_data) {
+            let converted = annex_b_to_length_prefixed(&raw_data);
+            if self.frame_count <= 5 {
+                tracing::info!(
+                    "VtDecoder: converted Annex B ({} bytes) -> length-prefixed ({} bytes)",
+                    raw_data.len(),
+                    converted.len()
+                );
+            }
+            converted
+        } else {
+            raw_data
+        };
 
         // Create CMBlockBuffer.
         // IMPORTANT: Pass kCFAllocatorNull as blockAllocator so CoreMedia does NOT
@@ -379,9 +420,7 @@ impl VideoDecoder for VtDecoder {
             // Don't bail — might be a recoverable error on a single frame
         } else if self.frame_count <= 10 || self.frame_count % 100 == 0 {
             // Check if the synchronous callback queued a frame
-            let queue_len = self.output.lock()
-                .map(|q| q.len())
-                .unwrap_or(999);
+            let queue_len = self.output.lock().map(|q| q.len()).unwrap_or(999);
             tracing::info!(
                 "VtDecoder: frame #{} decoded OK, output queue={}",
                 self.frame_count,
@@ -402,7 +441,10 @@ impl VideoDecoder for VtDecoder {
             if item.is_some() {
                 let remaining = q.len();
                 if remaining == 0 || remaining % 100 == 0 {
-                    tracing::info!("VtDecoder::pop_frame: got frame, {} remaining in queue", remaining);
+                    tracing::info!(
+                        "VtDecoder::pop_frame: got frame, {} remaining in queue",
+                        remaining
+                    );
                 }
             }
             item
@@ -427,6 +469,259 @@ impl VideoDecoder for VtDecoder {
         // VTDecompressionSession doesn't support dynamic viewport changes;
         // the caller would need to rescale the output frame if needed.
     }
+}
+
+// ── VtDecoder private helpers ──
+
+impl VtDecoder {
+    /// Create an uninitialized decoder that will be initialized on the first keyframe.
+    fn uninit(viewport_w: u32, viewport_h: u32) -> Self {
+        Self {
+            session: ptr::null_mut(),
+            format_desc: ptr::null(),
+            output: Arc::new(Mutex::new(VecDeque::new())),
+            viewport_w,
+            viewport_h,
+            frame_count: 0,
+            initialized: false,
+        }
+    }
+
+    /// Create a VTDecompressionSession from avcC description bytes.
+    ///
+    /// Returns `(session, format_desc, output_queue)` on success.
+    fn create_session(
+        desc_bytes: &[u8],
+    ) -> Result<(
+        VTDecompressionSessionRef,
+        CMFormatDescriptionRef,
+        Arc<Mutex<VecDeque<RawDecodedFrame>>>,
+    )> {
+        // Parse avcC to extract SPS and PPS
+        let (sps, pps) = parse_avcc(desc_bytes)?;
+
+        // Create CMFormatDescription from SPS + PPS
+        let param_sets: [*const u8; 2] = [sps.as_ptr(), pps.as_ptr()];
+        let param_sizes: [usize; 2] = [sps.len(), pps.len()];
+        let mut format_desc: CMFormatDescriptionRef = ptr::null();
+        let status = unsafe {
+            CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                kCFAllocatorDefault,
+                2,
+                param_sets.as_ptr(),
+                param_sizes.as_ptr(),
+                4, // 4-byte length-prefixed NALUs
+                &mut format_desc,
+            )
+        };
+        if status != 0 || format_desc.is_null() {
+            bail!("CMVideoFormatDescriptionCreateFromH264ParameterSets failed: {status}");
+        }
+
+        // Destination pixel buffer attributes — request BGRA output
+        let dest_attrs = unsafe {
+            let dict = CFDictionaryCreateMutable(
+                kCFAllocatorDefault,
+                1,
+                &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+                &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+            );
+            let pixel_format_val: i32 = K_CV_PIXEL_FORMAT_TYPE_32_BGRA as i32;
+            let cf_num = CFNumberCreate(
+                kCFAllocatorDefault,
+                K_CF_NUMBER_SINT32_TYPE,
+                &pixel_format_val as *const i32 as *const c_void,
+            );
+            CFDictionarySetValue(
+                dict,
+                kCVPixelBufferPixelFormatTypeKey as *const c_void,
+                cf_num as *const c_void,
+            );
+            CFRelease(cf_num as CFTypeRef);
+            dict
+        };
+
+        let output = Arc::new(Mutex::new(VecDeque::<RawDecodedFrame>::new()));
+        let output_ptr = Arc::into_raw(output.clone()) as *mut c_void;
+
+        let callback = VTDecompressionOutputCallbackRecord {
+            decompress_output_callback: vt_decompress_callback,
+            decompress_output_ref_con: output_ptr,
+        };
+
+        let mut session: VTDecompressionSessionRef = ptr::null_mut();
+        let status = unsafe {
+            VTDecompressionSessionCreate(
+                kCFAllocatorDefault,
+                format_desc,
+                ptr::null(), // videoDecoderSpecification
+                dest_attrs as CFDictionaryRef,
+                &callback,
+                &mut session,
+            )
+        };
+
+        unsafe { CFRelease(dest_attrs as CFTypeRef) };
+
+        if status != 0 || session.is_null() {
+            // Clean up format_desc on failure
+            unsafe { CFRelease(format_desc as CFTypeRef) };
+            bail!("VTDecompressionSessionCreate failed: {status}");
+        }
+
+        tracing::info!("VtDecoder::create_session: success, session={session:?}");
+        Ok((session, format_desc, output))
+    }
+
+    /// Extract SPS and PPS from AVCC-formatted (length-prefixed) keyframe data.
+    ///
+    /// Walks 4-byte length-prefixed NALUs and looks for SPS (type 7) and PPS (type 8).
+    fn try_extract_sps_pps_from_avcc(&self, data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        let mut sps: Option<Vec<u8>> = None;
+        let mut pps: Option<Vec<u8>> = None;
+        let mut offset = 0;
+
+        while offset + 4 <= data.len() {
+            let nalu_len = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            offset += 4;
+
+            if nalu_len == 0 || offset + nalu_len > data.len() {
+                break;
+            }
+
+            let nal_type = data[offset] & 0x1F;
+            match nal_type {
+                7 => {
+                    tracing::info!(
+                        "try_extract_sps_pps_from_avcc: found SPS ({} bytes)",
+                        nalu_len
+                    );
+                    sps = Some(data[offset..offset + nalu_len].to_vec());
+                }
+                8 => {
+                    tracing::info!(
+                        "try_extract_sps_pps_from_avcc: found PPS ({} bytes)",
+                        nalu_len
+                    );
+                    pps = Some(data[offset..offset + nalu_len].to_vec());
+                }
+                _ => {}
+            }
+
+            offset += nalu_len;
+        }
+
+        match (sps, pps) {
+            (Some(s), Some(p)) => Ok((s, p)),
+            (None, _) => bail!("AVCC keyframe: no SPS NAL unit found"),
+            (_, None) => bail!("AVCC keyframe: no PPS NAL unit found"),
+        }
+    }
+}
+
+/// Check if data starts with an Annex B start code (00 00 00 01 or 00 00 01).
+///
+/// The 4-byte check is unambiguous (length=1 NAL units don't occur in practice).
+/// The 3-byte check needs validation: AVCC data with NAL lengths 256-511 would
+/// have bytes [0x00, 0x00, 0x01, ...] which looks like a 3-byte start code.
+/// We validate by checking the NAL header byte (forbidden_zero_bit=0, type=1-23).
+fn is_annex_b(data: &[u8]) -> bool {
+    // 4-byte start code: unambiguous
+    if data.len() >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1 {
+        return true;
+    }
+    // 3-byte start code: validate the NAL header to avoid AVCC false positives
+    if data.len() >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 1 {
+        let nal_byte = data[3];
+        let forbidden_bit = nal_byte >> 7;
+        let nal_type = nal_byte & 0x1F;
+        // Valid H.264 NAL: forbidden_zero_bit=0, type 1-23
+        return forbidden_bit == 0 && nal_type >= 1 && nal_type <= 23;
+    }
+    false
+}
+
+/// Convert Annex B byte stream (00 00 00 01 delimited NALUs) to
+/// length-prefixed format (4-byte big-endian length + NALU data).
+///
+/// Filters out SEI NAL units (type 6) which VideoToolbox often rejects,
+/// and AUD NAL units (type 9) which are unnecessary for decoding.
+fn annex_b_to_length_prefixed(data: &[u8]) -> Vec<u8> {
+    let nalu_starts = find_annex_b_nalu_starts(data);
+    let mut out = Vec::with_capacity(data.len());
+
+    for (idx, &start) in nalu_starts.iter().enumerate() {
+        if start >= data.len() {
+            continue;
+        }
+        let end = if idx + 1 < nalu_starts.len() {
+            let next = nalu_starts[idx + 1];
+            if next >= 4
+                && data[next - 4] == 0
+                && data[next - 3] == 0
+                && data[next - 2] == 0
+                && data[next - 1] == 1
+            {
+                next - 4
+            } else if next >= 3 && data[next - 3] == 0 && data[next - 2] == 0 && data[next - 1] == 1
+            {
+                next - 3
+            } else {
+                next
+            }
+        } else {
+            data.len()
+        };
+
+        let nalu = &data[start..end];
+        if nalu.is_empty() {
+            continue;
+        }
+
+        let nal_type = nalu[0] & 0x1F;
+        // Skip SEI (6) and AUD (9) — VT doesn't need them and they can cause errors
+        if nal_type == 6 || nal_type == 9 {
+            continue;
+        }
+        // Skip SPS (7) and PPS (8) inline — already in the format description
+        if nal_type == 7 || nal_type == 8 {
+            continue;
+        }
+
+        let len = nalu.len() as u32;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(nalu);
+    }
+
+    out
+}
+
+/// Find all NAL unit start positions (byte after the start code) in Annex B data.
+fn find_annex_b_nalu_starts(data: &[u8]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        if i + 3 < data.len()
+            && data[i] == 0
+            && data[i + 1] == 0
+            && data[i + 2] == 0
+            && data[i + 3] == 1
+        {
+            starts.push(i + 4);
+            i += 4;
+        } else if i + 2 < data.len() && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    starts
 }
 
 /// Parse H.264 codec description into SPS and PPS byte slices.

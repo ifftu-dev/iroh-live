@@ -1,3 +1,18 @@
+// Copyright 2025 N0, INC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use hang::{
@@ -182,6 +197,12 @@ impl SubscribeBroadcast {
         quality: Quality,
     ) -> Result<WatchTrack> {
         let track_name = self.catalog().select_video_rendition(quality)?;
+        info!(
+            "watch_with: selected rendition '{}' for quality={:?} on broadcast='{}'",
+            track_name,
+            quality,
+            self.broadcast_name
+        );
         self.watch_rendition::<D>(playback_config, &track_name)
     }
 
@@ -200,7 +221,8 @@ impl SubscribeBroadcast {
         let has_desc = config.description.is_some();
         let desc_len = config.description.as_ref().map(|d| d.len()).unwrap_or(0);
         info!(
-            "watch_rendition: subscribing to video track '{}' ({}x{}, desc={has_desc}/{desc_len}B, max_latency={:?})",
+            "watch_rendition: broadcast='{}' subscribing to video track '{}' ({}x{}, desc={has_desc}/{desc_len}B, max_latency={:?})",
+            self.broadcast_name,
             track_name,
             config.coded_width.unwrap_or(0),
             config.coded_height.unwrap_or(0),
@@ -301,8 +323,8 @@ fn select_video_rendition<'a, T>(
         Quality::Mid => [P360, P180, P720, P1080],
         Quality::Low => [P180, P360, P720, P1080],
     };
-
-    select_rendition(renditions, &order)
+    let prefixed: Vec<String> = order.iter().map(|p| format!("video-{p}")).collect();
+    select_rendition(renditions, &prefixed)
 }
 
 fn select_audio_rendition<'a, T>(
@@ -314,7 +336,8 @@ fn select_audio_rendition<'a, T>(
         Quality::Highest | Quality::High => [Hq, Lq],
         Quality::Mid | Quality::Low => [Lq, Hq],
     };
-    select_rendition(renditions, &order)
+    let prefixed: Vec<String> = order.iter().map(|p| format!("audio-{p}")).collect();
+    select_rendition(renditions, &prefixed)
 }
 
 pub struct AudioTrack {
@@ -423,9 +446,21 @@ impl AudioTrack {
                         // TODO: Skip outdated packets?
 
                         if !sink.is_paused() {
-                            decoder.push_packet(packet)?;
-                            if let Some(samples) = decoder.pop_samples()? {
-                                sink.push_samples(samples)?;
+                            match decoder.push_packet(packet) {
+                                Ok(()) => match decoder.pop_samples() {
+                                    Ok(Some(samples)) => {
+                                        if let Err(e) = sink.push_samples(samples) {
+                                            warn!("audiodec: push_samples failed (pkt #{audio_pkt_count}): {e:#}");
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        warn!("audiodec: pop_samples failed (pkt #{audio_pkt_count}): {e:#}");
+                                    }
+                                },
+                                Err(e) => {
+                                    warn!("audiodec: decode failed (pkt #{audio_pkt_count}): {e:#}");
+                                }
                             }
                         }
                     }
@@ -663,8 +698,13 @@ impl WatchTrack {
                             };
 
                             if let Some(img) = image::RgbaImage::from_raw(w, h, rgba_data) {
+                                let final_img = if w > h {
+                                    image::DynamicImage::ImageRgba8(img).rotate90().to_rgba8()
+                                } else {
+                                    img
+                                };
                                 let decoded = DecodedFrame {
-                                    frame: image::Frame::new(img),
+                                    frame: image::Frame::new(final_img),
                                     timestamp: start.elapsed(),
                                 };
                                 let _ = frame_tx.blocking_send(decoded);
@@ -817,8 +857,18 @@ async fn forward_frames(mut track: hang::TrackConsumer, sender: mpsc::Sender<han
     let start = tokio::time::Instant::now();
     info!("forward_frames: STARTED, waiting for first frame from TrackConsumer");
     let mut count: u64 = 0;
+    let read_timeout = std::time::Duration::from_secs(5);
     loop {
-        let frame = track.read_frame().await;
+        let frame = match tokio::time::timeout(read_timeout, track.read_frame()).await {
+            Ok(result) => result,
+            Err(_) => {
+                let elapsed = start.elapsed();
+                warn!(
+                    "forward_frames: read_frame timeout after {count} frames ({elapsed:?}) — track likely dead"
+                );
+                break;
+            }
+        };
         match frame {
             Ok(Some(frame)) => {
                 count += 1;
@@ -872,12 +922,17 @@ impl AvRemoteTrack {
     ) -> Result<Self> {
         let audio = broadcast
             .listen_with::<D::Audio>(playback_config.quality, audio_out)
-            .inspect_err(|err| tracing::warn!("no audio track: {err}"))
+            .inspect_err(|err| tracing::warn!("AvRemoteTrack: audio subscription failed: {err:#}"))
             .ok();
         let video = broadcast
             .watch_with::<D::Video>(&playback_config.decode_config, playback_config.quality)
-            .inspect_err(|err| tracing::warn!("no video track: {err}"))
+            .inspect_err(|err| tracing::warn!("AvRemoteTrack: video subscription failed: {err:#}"))
             .ok();
+        info!(
+            "AvRemoteTrack::new: audio={}, video={}",
+            audio.is_some(),
+            video.is_some()
+        );
         Ok(Self {
             broadcast,
             audio,

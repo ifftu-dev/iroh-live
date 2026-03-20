@@ -1,3 +1,18 @@
+// Copyright 2025 N0, INC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
 use anyhow::Result;
 use ffmpeg_next::{self as ffmpeg, util::channel_layout::ChannelLayout};
 use hang::catalog::AudioConfig;
@@ -77,9 +92,7 @@ impl AudioDecoder for FfmpegAudioDecoder {
 
     fn pop_samples(&mut self) -> Result<Option<&[f32]>> {
         match self.codec.receive_frame(&mut self.decoded_frame) {
-            Err(err) => Err(err.into()),
             Ok(()) => {
-                // Create an empty frame to hold the resampled audio data.
                 self.resampler
                     .run(&self.decoded_frame, &mut self.resampled_frame)
                     .unwrap();
@@ -88,6 +101,8 @@ impl AudioDecoder for FfmpegAudioDecoder {
                     frame.samples() * frame.channels() as usize * core::mem::size_of::<f32>();
                 Ok(Some(bytemuck::cast_slice(&frame.data(0)[..expected_bytes])))
             }
+            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::util::error::EAGAIN => Ok(None),
+            Err(err) => Err(err.into()),
         }
     }
 }
