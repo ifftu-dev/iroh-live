@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! iOS camera capture using AVFoundation (AVCaptureSession).
 //!
 //! Implements the `VideoSource` trait by capturing BGRA frames from the
@@ -21,7 +20,8 @@
 //!
 //! ## Architecture
 //!
-//! 1. Creates an `AVCaptureSession` with `.medium` preset (640x480 BGRA).
+//! 1. Creates an `AVCaptureSession` with a preferred HD preset (`1280x720`)
+//!    and falls back to `.medium` (`640x480 BGRA`) when HD is unavailable.
 //! 2. Adds an `AVCaptureDeviceInput` for the front camera (or back as fallback).
 //! 3. Adds an `AVCaptureVideoDataOutput` configured for BGRA pixel format.
 //! 4. Sets a delegate (Rust-allocated ObjC class) that receives
@@ -32,11 +32,12 @@
 //!
 //! ## Important
 //!
-//! AVFoundation NSString constants (e.g. `AVCaptureSessionPresetMedium`,
-//! `AVMediaTypeVideo`) are loaded at runtime via `dlsym` from the framework
-//! binary — NOT created as literal NSStrings. This is critical because these
-//! constants are framework-exported `NSString *` globals, and passing a
-//! manually-created NSString with the same text content will NOT match.
+//! AVFoundation NSString constants (e.g. `AVCaptureSessionPreset1280x720`,
+//! `AVCaptureSessionPresetMedium`, `AVMediaTypeVideo`) are loaded at runtime
+//! via `dlsym` from the framework binary — NOT created as literal NSStrings.
+//! This is critical because these constants are framework-exported `NSString *`
+//! globals, and passing a manually-created NSString with the same text content
+//! will NOT match.
 //!
 //! ## Safety
 //!
@@ -47,7 +48,7 @@ use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::sync::mpsc;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use bytes::Bytes;
 
 use crate::av::{PixelFormat, VideoFormat, VideoFrame, VideoSource};
@@ -128,6 +129,14 @@ unsafe fn msg_send_0(obj: Id, sel_name: &[u8]) -> Id {
 /// One-arg message send where arg is Id (pointer-sized).
 unsafe fn msg_send_1id(obj: Id, sel_name: &[u8], a1: Id) -> Id {
     type F = unsafe extern "C" fn(Id, Sel, Id) -> Id;
+    let sel = sel_registerName(sel_name.as_ptr());
+    let f: F = std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel, ...) -> Id);
+    f(obj, sel, a1)
+}
+
+/// One-arg message send where arg is Id and return value is BOOL.
+unsafe fn msg_send_bool_1id(obj: Id, sel_name: &[u8], a1: Id) -> BOOL {
+    type F = unsafe extern "C" fn(Id, Sel, Id) -> BOOL;
     let sel = sel_registerName(sel_name.as_ptr());
     let f: F = std::mem::transmute(objc_msgSend as unsafe extern "C" fn(Id, Sel, ...) -> Id);
     f(obj, sel, a1)
@@ -332,7 +341,7 @@ unsafe impl Send for IosCameraSource {}
 impl IosCameraSource {
     /// Create a new camera source using the back camera (front as fallback).
     ///
-    /// Resolution defaults to 640x480 (AVCaptureSessionPresetMedium).
+    /// Resolution prefers 1280x720 and falls back to 640x480.
     pub fn new() -> Result<Self> {
         Self::with_position(1) // 1 = AVCaptureDevicePositionBack
     }
@@ -347,6 +356,7 @@ impl IosCameraSource {
 
         unsafe {
             // Load framework constants via dlsym
+            let preset_hd = load_framework_nsstring(b"AVCaptureSessionPreset1280x720\0");
             let preset_medium = load_framework_nsstring(b"AVCaptureSessionPresetMedium\0");
             if preset_medium.is_null() {
                 bail!("Failed to load AVCaptureSessionPresetMedium constant");
@@ -363,8 +373,16 @@ impl IosCameraSource {
                 bail!("Failed to create AVCaptureSession");
             }
 
-            // Set preset to Medium (640x480) using the real framework constant
-            msg_send_1id(session, b"setSessionPreset:\0", preset_medium);
+            let preferred_preset = if !preset_hd.is_null()
+                && msg_send_bool_1id(session, b"canSetSessionPreset:\0", preset_hd) == YES
+            {
+                tracing::info!("iOS camera: using AVCaptureSessionPreset1280x720");
+                preset_hd
+            } else {
+                tracing::info!("iOS camera: falling back to AVCaptureSessionPresetMedium");
+                preset_medium
+            };
+            msg_send_1id(session, b"setSessionPreset:\0", preferred_preset);
 
             // Get camera device
             let device = find_camera_device(position);

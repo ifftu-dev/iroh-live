@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr};
 use iroh_moq::{Moq, MoqProtocolHandler, MoqSession};
@@ -23,7 +24,7 @@ use moq_media::{
     subscribe::AvRemoteTrack,
 };
 use n0_error::Result;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct Live {
@@ -46,9 +47,54 @@ impl Live {
         remote: impl Into<EndpointAddr>,
         broadcast_name: &str,
     ) -> Result<(MoqSession, SubscribeBroadcast)> {
-        let mut session = self.connect(remote).await?;
+        let remote = remote.into();
+        let mut session = self.connect(remote.clone()).await?;
         info!(id=%session.conn().remote_id(), "new peer connected");
-        let broadcast = session.subscribe(broadcast_name).await?;
+
+        let broadcast = match tokio::time::timeout(
+            Duration::from_secs(5),
+            session.subscribe(broadcast_name),
+        )
+        .await
+        {
+            Ok(Ok(broadcast)) => broadcast,
+            Ok(Err(err)) => {
+                session.close(0, b"subscribe failed");
+                return Err(err.into());
+            }
+            Err(_) => {
+                warn!(
+                    id = %session.conn().remote_id(),
+                    broadcast = %broadcast_name,
+                    "subscribe timed out on cached session, closing and retrying with a fresh connection"
+                );
+                session.close(0, b"subscribe timeout");
+
+                let mut session = self.connect(remote).await?;
+                info!(
+                    id = %session.conn().remote_id(),
+                    broadcast = %broadcast_name,
+                    "reconnected peer after subscribe timeout"
+                );
+                let broadcast =
+                    tokio::time::timeout(Duration::from_secs(5), session.subscribe(broadcast_name))
+                        .await
+                        .map_err(|_| {
+                            session.close(0, b"subscribe retry timeout");
+                            n0_error::anyerr!(
+                                "subscribe to '{broadcast_name}' timed out after reconnect"
+                            )
+                        })?
+                        .map_err(|err| {
+                            session.close(0, b"subscribe retry failed");
+                            err
+                        })?;
+                let broadcast =
+                    SubscribeBroadcast::new(broadcast_name.to_string(), broadcast).await?;
+                return Ok((session, broadcast));
+            }
+        };
+
         let broadcast = SubscribeBroadcast::new(broadcast_name.to_string(), broadcast).await?;
         Ok((session, broadcast))
     }

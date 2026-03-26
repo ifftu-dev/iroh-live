@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use std::{
     collections::HashMap,
     sync::{
@@ -23,10 +22,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+pub use firewheel::cpal::DeviceInfo;
+pub use firewheel::cpal::cpal::DeviceId;
 use firewheel::{
     FirewheelConfig, FirewheelContext,
-    cpal::{CpalConfig, CpalEnumerator, CpalInputConfig, CpalOutputConfig},
     channel_config::{ChannelConfig, ChannelCount, NonZeroChannelCount},
+    cpal::{CpalConfig, CpalEnumerator, CpalInputConfig, CpalOutputConfig},
     dsp::volume::{DEFAULT_DB_EPSILON, DbMeterNormalizer},
     graph::PortIdx,
     node::NodeID,
@@ -39,8 +40,6 @@ use firewheel::{
         },
     },
 };
-pub use firewheel::cpal::DeviceInfo;
-pub use firewheel::cpal::cpal::DeviceId;
 use tokio::sync::{mpsc, mpsc::error::TryRecvError, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
@@ -104,6 +103,7 @@ impl AudioBackend {
             .await?;
         let (handle, peaks) = reply_rx.await??;
         Ok(InputStream {
+            _backend_tx: Some(self.tx.clone()),
             handle,
             format,
             peaks,
@@ -120,13 +120,15 @@ impl AudioBackend {
         self.tx
             .send(DriverMessage::OutputStream { format, reply })
             .await?;
-        let handle = reply_rx.await??;
+        let mut handle = reply_rx.await??;
+        handle._backend_tx = Some(self.tx.clone());
         Ok(handle)
     }
 }
 
 #[derive(Clone)]
 pub struct OutputStream {
+    _backend_tx: Option<mpsc::Sender<DriverMessage>>,
     handle: StreamWriterHandle,
     paused: Arc<AtomicBool>,
     peaks: Arc<Mutex<PeakMeterSmoother<2>>>,
@@ -187,6 +189,13 @@ impl AudioSink for OutputStream {
     fn push_samples(&mut self, samples: &[f32]) -> Result<()> {
         let mut handle = self.handle.lock().unwrap();
 
+        if !handle.is_active() {
+            handle.resume();
+            if !handle.is_active() {
+                anyhow::bail!("output stream inactive");
+            }
+        }
+
         // If this happens excessively in Release mode, you may want to consider
         // increasing [`StreamWriterConfig::channel_config.latency_seconds`].
         if handle.underflow_occurred() {
@@ -209,7 +218,11 @@ impl AudioSink for OutputStream {
             handle.push_interleaved(samples);
             trace!("pushed samples {}", samples.len());
         } else {
-            warn!("output handle is inactive")
+            handle.resume();
+            trace!(
+                "output stream not ready, dropping {} samples",
+                samples.len()
+            );
         }
         Ok(())
     }
@@ -228,6 +241,7 @@ impl OutputStream {
 /// indicator (VU meter) without modifying the audio samples.
 #[derive(Clone)]
 pub struct InputStream {
+    _backend_tx: Option<mpsc::Sender<DriverMessage>>,
     handle: StreamReaderHandle,
     format: AudioFormat,
     peaks: Arc<Mutex<PeakMeterSmoother<1>>>,
@@ -261,7 +275,8 @@ impl AudioSource for InputStream {
             Some(ReadStatus::Ok) => Ok(Some(buf.len())),
             Some(ReadStatus::InputNotReady) => {
                 tracing::warn!("audio input not ready");
-                // Maintain pacing; still return a frame-sized buffer
+                // Maintain pacing but never feed stale samples into the encoder.
+                buf.fill(0.0);
                 Ok(Some(buf.len()))
             }
             Some(ReadStatus::UnderflowOccurred { num_frames_read }) => {
@@ -269,12 +284,17 @@ impl AudioSource for InputStream {
                     "audio input underflow: {} frames missing",
                     buf.len() - num_frames_read
                 );
+                let start = num_frames_read * self.format.channel_count as usize;
+                if start < buf.len() {
+                    buf[start..].fill(0.0);
+                }
                 Ok(Some(buf.len()))
             }
             Some(ReadStatus::OverflowCorrected {
                 num_frames_discarded,
             }) => {
                 tracing::warn!("audio input overflow: {num_frames_discarded} frames discarded");
+                buf.fill(0.0);
                 Ok(Some(buf.len()))
             }
             None => {
@@ -567,6 +587,7 @@ impl AudioDriver {
             .unwrap()
             .handle();
         Ok(OutputStream {
+            _backend_tx: None,
             handle: Arc::new(handle),
             paused: Arc::new(AtomicBool::new(false)),
             peaks: peak_meter_smoother,
