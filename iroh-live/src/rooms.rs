@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -76,11 +75,7 @@ impl RoomHandle {
     /// Force the room actor to remove a broadcast from active subscriptions and reconnect.
     /// Call this when you detect a subscription has died (e.g., frame bridge ended)
     /// but `broadcast.closed()` hasn't fired.
-    pub async fn force_resubscribe(
-        &self,
-        remote: EndpointId,
-        name: impl ToString,
-    ) -> Result<()> {
+    pub async fn force_resubscribe(&self, remote: EndpointId, name: impl ToString) -> Result<()> {
         self.tx
             .send(ApiMessage::ForceResubscribe {
                 remote,
@@ -311,11 +306,10 @@ impl Actor {
                 }
                 Some(id) = self.subscribe_closed.next(), if !self.subscribe_closed.is_empty() => {
                     self.active_subscribe.remove(&id);
-                    // Drop our reference but do NOT close the session — it is
-                    // shared bidirectionally (pub + sub) and closing it would
-                    // kill publishing tracks going the other direction, causing
-                    // a force_resubscribe cascade on the remote peer.
-                    self.active_sessions.remove(&id);
+                    // Keep the MoQ session alive across subscription repair.
+                    // The session is shared bidirectionally (pub + sub), so
+                    // dropping it here can kill the reverse publishing tracks
+                    // and collapse the whole tutoring connection.
                     self.schedule_retry(id);
                 }
                 Some(id) = self.retry_timers.next(), if !self.retry_timers.is_empty() => {
@@ -361,7 +355,9 @@ impl Actor {
                     self.active_subscribe.insert(id.clone());
                     self.start_connect_and_subscribe(id, remote, name);
                 } else {
-                    info!("force_resubscribe: {id} — peer no longer in known_remote_broadcasts, skipping");
+                    info!(
+                        "force_resubscribe: {id} — peer no longer in known_remote_broadcasts, skipping"
+                    );
                 }
             }
         }
@@ -393,12 +389,7 @@ impl Actor {
     }
 
     /// Attempt to connect and subscribe to a broadcast.
-    fn start_connect_and_subscribe(
-        &mut self,
-        id: BroadcastId,
-        remote: EndpointId,
-        name: String,
-    ) {
+    fn start_connect_and_subscribe(&mut self, id: BroadcastId, remote: EndpointId, name: String) {
         let live = self.live.clone();
         let addr = self.peer_addrs.get(&remote).cloned().unwrap_or_else(|| {
             let mut addr = EndpointAddr::from(remote);
@@ -445,7 +436,9 @@ impl Actor {
                         name = %name,
                         "room: connect_and_subscribe timed out after 10s"
                     );
-                    Err(n0_error::anyerr!("connect_and_subscribe timed out after 10s"))
+                    Err(n0_error::anyerr!(
+                        "connect_and_subscribe timed out after 10s"
+                    ))
                 }
             };
             (id, session)

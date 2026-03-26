@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use hang::{
@@ -30,18 +29,21 @@ use tokio::{
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{Span, debug, error, info, info_span, trace, warn};
 
+#[cfg(any(feature = "video", feature = "video-ios"))]
+use crate::av::VideoSource;
+#[cfg(any(feature = "video", feature = "video-ios"))]
+use crate::av::{DecodeConfig, DecodedFrame, Decoders, PlaybackConfig, VideoDecoder};
+#[cfg(feature = "video")]
+use crate::ffmpeg::util::Rescaler;
 use crate::{
     av::{AudioDecoder, AudioSink, AudioSinkHandle, Quality},
     util::spawn_thread,
 };
-#[cfg(any(feature = "video", feature = "video-ios"))]
-use crate::av::{DecodeConfig, DecodedFrame, Decoders, PlaybackConfig, VideoDecoder};
-#[cfg(any(feature = "video", feature = "video-ios"))]
-use crate::av::VideoSource;
-#[cfg(feature = "video")]
-use crate::ffmpeg::util::Rescaler;
 
 const DEFAULT_MAX_LATENCY: Duration = Duration::from_millis(150);
+
+// 30s timeout — 5s was too aggressive for audio (silence, network spikes, GC pauses).
+const AUDIO_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(derive_more::Debug, Clone)]
 pub struct SubscribeBroadcast {
@@ -119,8 +121,6 @@ impl CatalogWrapper {
 
 impl SubscribeBroadcast {
     pub async fn new(broadcast_name: String, broadcast: BroadcastConsumer) -> Result<Self> {
-        let shutdown = CancellationToken::new();
-
         let (catalog_watchable, catalog_task) = {
             let track = broadcast.subscribe_track(&Catalog::default_track());
             let mut consumer = CatalogConsumer::new(track);
@@ -131,8 +131,15 @@ impl SubscribeBroadcast {
                 .context("Catalog track closed before receiving catalog")?;
             let watchable = Watchable::new(CatalogWrapper::new(initial_catalog, 0));
 
+            // Use a SEPARATE token for the catalog task so its exit doesn't
+            // kill audio/video subscriptions. Previously, the catalog task
+            // shared `shutdown` and called `shutdown.cancel()` on exit, which
+            // cancelled all active audio and video tracks — causing a 3-second
+            // audio dropout every time the catalog track closed.
+            let catalog_shutdown = CancellationToken::new();
+
             let task = tokio::spawn({
-                let shutdown = shutdown.clone();
+                let catalog_shutdown = catalog_shutdown.clone();
                 let watchable = watchable.clone();
                 async move {
                     for seq in 1.. {
@@ -150,7 +157,9 @@ impl SubscribeBroadcast {
                             }
                         }
                     }
-                    shutdown.cancel();
+                    // Only cancel the catalog's own token — `shutdown` (used by
+                    // audio/video tracks) stays alive so playback continues.
+                    catalog_shutdown.cancel();
                 }
             });
             (watchable, task)
@@ -199,9 +208,7 @@ impl SubscribeBroadcast {
         let track_name = self.catalog().select_video_rendition(quality)?;
         info!(
             "watch_with: selected rendition '{}' for quality={:?} on broadcast='{}'",
-            track_name,
-            quality,
-            self.broadcast_name
+            track_name, quality, self.broadcast_name
         );
         self.watch_rendition::<D>(playback_config, &track_name)
     }
@@ -268,10 +275,7 @@ impl SubscribeBroadcast {
         let config = audio.renditions.get(name).context("rendition not found")?;
         info!(
             "listen_rendition: subscribing to audio track '{}' (sample_rate={}, channels={}, max_latency={:?})",
-            name,
-            config.sample_rate,
-            config.channel_count,
-            DEFAULT_MAX_LATENCY,
+            name, config.sample_rate, config.channel_count, DEFAULT_MAX_LATENCY,
         );
         let consumer = TrackConsumer::new(
             self.broadcast.subscribe_track(&Track {
@@ -408,6 +412,7 @@ impl AudioTrack {
         let mut remote_start = None;
         let loop_start = Instant::now();
         let mut audio_pkt_count: u64 = 0;
+        let mut consecutive_sink_failures: u32 = 0;
         info!("audiodec: run_loop starting, waiting for packets...");
 
         'main: for i in 0.. {
@@ -450,16 +455,33 @@ impl AudioTrack {
                                 Ok(()) => match decoder.pop_samples() {
                                     Ok(Some(samples)) => {
                                         if let Err(e) = sink.push_samples(samples) {
-                                            warn!("audiodec: push_samples failed (pkt #{audio_pkt_count}): {e:#}");
+                                            warn!(
+                                                "audiodec: push_samples failed (pkt #{audio_pkt_count}): {e:#}"
+                                            );
+                                            sink.resume();
+                                            consecutive_sink_failures += 1;
+                                            if consecutive_sink_failures >= 25 {
+                                                warn!(
+                                                    "audiodec: output sink failed {} times in a row, restarting track",
+                                                    consecutive_sink_failures
+                                                );
+                                                break 'main;
+                                            }
+                                        } else {
+                                            consecutive_sink_failures = 0;
                                         }
                                     }
                                     Ok(None) => {}
                                     Err(e) => {
-                                        warn!("audiodec: pop_samples failed (pkt #{audio_pkt_count}): {e:#}");
+                                        warn!(
+                                            "audiodec: pop_samples failed (pkt #{audio_pkt_count}): {e:#}"
+                                        );
                                     }
                                 },
                                 Err(e) => {
-                                    warn!("audiodec: decode failed (pkt #{audio_pkt_count}): {e:#}");
+                                    warn!(
+                                        "audiodec: decode failed (pkt #{audio_pkt_count}): {e:#}"
+                                    );
                                 }
                             }
                         }
@@ -813,11 +835,15 @@ impl WatchTrack {
         info!("videodec: run_loop starting, waiting for first packet...");
         loop {
             if shutdown.is_cancelled() {
-                info!("videodec: run_loop cancelled after {pkt_count} packets, {decoded_count} decoded frames");
+                info!(
+                    "videodec: run_loop cancelled after {pkt_count} packets, {decoded_count} decoded frames"
+                );
                 break;
             }
             let Some(packet) = input_rx.blocking_recv() else {
-                info!("videodec: run_loop input channel closed after {pkt_count} packets, {decoded_count} decoded frames");
+                info!(
+                    "videodec: run_loop input channel closed after {pkt_count} packets, {decoded_count} decoded frames"
+                );
                 break;
             };
             pkt_count += 1;
@@ -836,7 +862,9 @@ impl WatchTrack {
                     let img = frame.img();
                     info!(
                         "videodec: decoded frame #{decoded_count} (from {pkt_count} packets), {}x{}, elapsed={:?}",
-                        img.width(), img.height(), t.elapsed()
+                        img.width(),
+                        img.height(),
+                        t.elapsed()
                     );
                 }
                 if output_tx.blocking_send(frame).is_err() {
@@ -846,7 +874,9 @@ impl WatchTrack {
                 trace!(t=?t.elapsed(), "videodec: tx");
             }
             if pkt_count <= 3 || pkt_count % 100 == 0 {
-                info!("videodec: processed packet #{pkt_count}, total decoded frames: {decoded_count}");
+                info!(
+                    "videodec: processed packet #{pkt_count}, total decoded frames: {decoded_count}"
+                );
             }
         }
         Ok(())
@@ -857,9 +887,8 @@ async fn forward_frames(mut track: hang::TrackConsumer, sender: mpsc::Sender<han
     let start = tokio::time::Instant::now();
     info!("forward_frames: STARTED, waiting for first frame from TrackConsumer");
     let mut count: u64 = 0;
-    let read_timeout = std::time::Duration::from_secs(5);
     loop {
-        let frame = match tokio::time::timeout(read_timeout, track.read_frame()).await {
+        let frame = match tokio::time::timeout(AUDIO_READ_TIMEOUT, track.read_frame()).await {
             Ok(result) => result,
             Err(_) => {
                 let elapsed = start.elapsed();

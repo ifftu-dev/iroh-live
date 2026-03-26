@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
@@ -30,14 +29,14 @@ use n0_future::task::AbortOnDropHandle;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info, info_span, trace, warn};
 
+#[cfg(any(feature = "video", feature = "video-ios"))]
+use crate::av::{VideoEncoder, VideoEncoderInner, VideoPreset, VideoSource};
+#[cfg(any(feature = "video", feature = "video-ios"))]
+use crate::{av::DecodeConfig, subscribe::WatchTrack};
 use crate::{
     av::{AudioEncoder, AudioEncoderInner, AudioPreset, AudioSource},
     util::spawn_thread,
 };
-#[cfg(any(feature = "video", feature = "video-ios"))]
-use crate::{av::DecodeConfig, subscribe::WatchTrack};
-#[cfg(any(feature = "video", feature = "video-ios"))]
-use crate::av::{VideoEncoder, VideoEncoderInner, VideoPreset, VideoSource};
 
 pub struct PublishBroadcast {
     producer: BroadcastProducer,
@@ -266,7 +265,8 @@ impl State {
         if let Some(audio) = self.available_audio.as_mut()
             && audio.contains_rendition(&name)
         {
-            let thread = audio.start_encoder(&name, track, shutdown_token, self.audio_muted.clone())?;
+            let thread =
+                audio.start_encoder(&name, track, shutdown_token, self.audio_muted.clone())?;
             self.active_audio.insert(name, thread);
             Ok(())
         } else {
@@ -576,8 +576,13 @@ impl EncoderThread {
                         }
                     } else {
                         null_frame_count += 1;
-                        if null_frame_count == 1 || null_frame_count == 30 || null_frame_count % 300 == 0 {
-                            warn!("videoenc: source returned None ({null_frame_count} times, {enc_frame_count} frames so far)");
+                        if null_frame_count == 1
+                            || null_frame_count == 30
+                            || null_frame_count % 300 == 0
+                        {
+                            warn!(
+                                "videoenc: source returned None ({null_frame_count} times, {enc_frame_count} frames so far)"
+                            );
                         }
                     }
                     std::thread::sleep(interval.saturating_sub(start.elapsed()));
@@ -612,6 +617,13 @@ impl EncoderThread {
             let shutdown = sd;
             // 20ms framing to align with typical Opus config (48kHz → 960 samples/ch)
             const INTERVAL: Duration = Duration::from_millis(20);
+            // Audio frames are independently decodable, but `hang::TrackProducer`
+            // starts a new group on every keyframe. Marking every 20ms Opus packet
+            // as a keyframe creates a flood of tiny groups, and that has been
+            // stalling live audio delivery while video keeps flowing. Group audio
+            // more coarsely so the transport sees a continuous stream instead of a
+            // new group every packet.
+            const AUDIO_KEYFRAME_INTERVAL_PACKETS: u64 = 25; // 500ms at 20ms/packet
             let format = source.format();
             let samples_per_frame = (format.sample_rate / 1000) * INTERVAL.as_millis() as u32;
             let mut buf = vec![0.0f32; samples_per_frame as usize * format.channel_count as usize];
@@ -631,7 +643,10 @@ impl EncoderThread {
                         Ok(Some(_n)) => true,
                         Ok(None) => {
                             audio_none_count += 1;
-                            if audio_none_count == 1 || audio_none_count == 50 || audio_none_count % 500 == 0 {
+                            if audio_none_count == 1
+                                || audio_none_count == 50
+                                || audio_none_count % 500 == 0
+                            {
                                 warn!("audioenc: source returned None ({audio_none_count} times)");
                             }
                             false
@@ -648,15 +663,19 @@ impl EncoderThread {
                         error!(buf_len = buf.len(), "audio push_samples failed: {err:#}");
                         break;
                     }
-                    while let Ok(Some(pkt)) = encoder
+                    while let Ok(Some(mut pkt)) = encoder
                         .pop_packet()
                         .inspect_err(|err| warn!("encoder error: {err:#}"))
                     {
-                        audio_pkt_count += 1;
+                        let packet_index = audio_pkt_count + 1;
+                        pkt.keyframe = packet_index == 1
+                            || packet_index % AUDIO_KEYFRAME_INTERVAL_PACKETS == 0;
+                        audio_pkt_count = packet_index;
                         if audio_pkt_count <= 3 || audio_pkt_count % 500 == 0 {
                             info!(
-                                "audioenc: packet #{audio_pkt_count}, bytes={}",
-                                pkt.payload.num_bytes()
+                                "audioenc: packet #{audio_pkt_count}, bytes={}, keyframe={}",
+                                pkt.payload.num_bytes(),
+                                pkt.keyframe
                             );
                         }
                         if let Err(err) = producer.write(pkt) {

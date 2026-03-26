@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! VideoToolbox H.264 decoder for iOS.
 //!
 //! Uses `VTDecompressionSession` to decode H.264 length-prefixed NAL units
@@ -24,7 +23,7 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 
 use crate::av::{DecodeConfig, DecodedFrame, PixelFormat, VideoDecoder};
@@ -58,6 +57,30 @@ const K_CM_TIME_FLAGS_VALID: u32 = 1;
 const K_CV_PIXEL_FORMAT_TYPE_32_BGRA: u32 = 0x42475241;
 const K_CV_PIXEL_FORMAT_TYPE_32_RGBA: u32 = 0x52474241; // 'RGBA' — not universally supported
 const K_CF_NUMBER_SINT32_TYPE: i64 = 3;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct CMSampleTimingInfo {
+    duration: CMTimeRepr,
+    presentation_time_stamp: CMTimeRepr,
+    decode_time_stamp: CMTimeRepr,
+}
+
+fn cm_time(value: i64, timescale: i32) -> CMTimeRepr {
+    CMTimeRepr {
+        value,
+        timescale,
+        flags: K_CM_TIME_FLAGS_VALID,
+        epoch: 0,
+    }
+}
+
+const K_CM_TIME_INVALID: CMTimeRepr = CMTimeRepr {
+    value: 0,
+    timescale: 0,
+    flags: 0,
+    epoch: 0,
+};
 
 unsafe extern "C" {
     // CoreFoundation
@@ -98,16 +121,13 @@ unsafe extern "C" {
         nal_unit_header_length: i32,
         format_description_out: *mut CMFormatDescriptionRef,
     ) -> OSStatus;
-    fn CMSampleBufferCreate(
+    fn CMSampleBufferCreateReady(
         allocator: CFAllocatorRef,
         data_buffer: CMBlockBufferRef,
-        data_ready: u8,
-        make_data_ready_callback: *const c_void,
-        make_data_ready_ref_con: *mut c_void,
         format_description: CMFormatDescriptionRef,
         num_samples: i32,
         num_sample_timing_entries: i32,
-        sample_timing_array: *const c_void,
+        sample_timing_array: *const CMSampleTimingInfo,
         num_sample_size_entries: i32,
         sample_size_array: *const usize,
         sample_buffer_out: *mut CMSampleBufferRef,
@@ -207,32 +227,36 @@ impl VideoDecoder for VtDecoder {
         let viewport_h = config.coded_height.unwrap_or(480);
 
         match config.description.as_ref() {
-            Some(desc_bytes) => match Self::create_session(desc_bytes) {
-                Ok((session, format_desc, output)) => {
-                    tracing::info!(
-                        "VtDecoder created (eager): session={session:?}, {viewport_w}x{viewport_h}"
-                    );
-                    Ok(Self {
-                        session,
-                        format_desc,
-                        output,
-                        viewport_w,
-                        viewport_h,
-                        frame_count: 0,
-                        initialized: true,
-                    })
-                }
-                Err(e) => {
-                    tracing::warn!(
-                            "VtDecoder: description present but init failed: {e:#}, deferring to first keyframe"
-                        );
-                    Ok(Self::uninit(viewport_w, viewport_h))
-                }
-            },
-            None => {
+            Some(desc_bytes) => {
                 tracing::info!(
-                    "VtDecoder: no description in catalog, deferring init to first keyframe"
+                    "VtDecoder: got description ({} bytes) from catalog, attempting eager init",
+                    desc_bytes.len()
                 );
+                match Self::create_session(desc_bytes) {
+                    Ok((session, format_desc, output)) => {
+                        tracing::info!(
+                            "VtDecoder created (eager): session={session:?}, {viewport_w}x{viewport_h}"
+                        );
+                        Ok(Self {
+                            session,
+                            format_desc,
+                            output,
+                            viewport_w,
+                            viewport_h,
+                            frame_count: 0,
+                            initialized: true,
+                        })
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "VtDecoder: eager init failed: {e:#}, deferring to first keyframe"
+                        );
+                        Ok(Self::uninit(viewport_w, viewport_h))
+                    }
+                }
+            }
+            None => {
+                tracing::warn!("VtDecoder: no description in catalog - will need keyframe to init");
                 Ok(Self::uninit(viewport_w, viewport_h))
             }
         }
@@ -347,6 +371,13 @@ impl VideoDecoder for VtDecoder {
         } else {
             raw_data
         };
+        if data.is_empty() {
+            tracing::debug!(
+                "VtDecoder: frame #{} produced no decodable NAL units after filtering",
+                self.frame_count
+            );
+            return Ok(());
+        }
 
         // Create CMBlockBuffer.
         // IMPORTANT: Pass kCFAllocatorNull as blockAllocator so CoreMedia does NOT
@@ -371,18 +402,24 @@ impl VideoDecoder for VtDecoder {
 
         // Create CMSampleBuffer
         let sample_size = data.len();
+        let pts = {
+            let pts_duration: Duration = packet.timestamp.into();
+            cm_time(pts_duration.as_micros() as i64, 1_000_000)
+        };
+        let timing = CMSampleTimingInfo {
+            duration: K_CM_TIME_INVALID,
+            presentation_time_stamp: pts,
+            decode_time_stamp: K_CM_TIME_INVALID,
+        };
         let mut sample_buffer: CMSampleBufferRef = ptr::null();
         let status = unsafe {
-            CMSampleBufferCreate(
+            CMSampleBufferCreateReady(
                 kCFAllocatorDefault,
                 block_buffer,
-                1, // data_ready
-                ptr::null(),
-                ptr::null_mut(),
                 self.format_desc,
                 1, // num_samples
-                0, // num_sample_timing_entries (no timing)
-                ptr::null(),
+                1, // num_sample_timing_entries
+                &timing,
                 1, // num_sample_size_entries
                 &sample_size,
                 &mut sample_buffer,

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use std::{
     ffi::{CString, c_int},
     ptr,
@@ -63,18 +62,25 @@ impl HwBackend {
     }
 
     fn candidates() -> Vec<Self> {
-        // vec![HwBackend::Software]
         let mut candidates = Vec::new();
-        // Platform-preferred order
-        #[cfg(target_os = "macos")]
-        candidates.extend_from_slice(&[HwBackend::Videotoolbox]);
-        #[cfg(target_os = "windows")]
-        candidates.extend_from_slice(&[HwBackend::Nvenc, HwBackend::Qsv, HwBackend::Amf]);
-        #[cfg(target_os = "linux")]
-        candidates.extend_from_slice(&[HwBackend::Vaapi, HwBackend::Nvenc, HwBackend::Qsv]);
 
-        // Always end with software
-        candidates.push(HwBackend::Software);
+        // On macOS, prefer libx264 first. The ffmpeg VideoToolbox encoder is
+        // faster, but its output has been less reliable for the iOS
+        // VideoToolbox decoder path used by the tutoring mobile client.
+        #[cfg(target_os = "macos")]
+        candidates.extend_from_slice(&[HwBackend::Software, HwBackend::Videotoolbox]);
+
+        // Platform-preferred order elsewhere.
+        #[cfg(not(target_os = "macos"))]
+        {
+            #[cfg(target_os = "windows")]
+            candidates.extend_from_slice(&[HwBackend::Nvenc, HwBackend::Qsv, HwBackend::Amf]);
+            #[cfg(target_os = "linux")]
+            candidates.extend_from_slice(&[HwBackend::Vaapi, HwBackend::Nvenc, HwBackend::Qsv]);
+
+            // Always end with software
+            candidates.push(HwBackend::Software);
+        }
         candidates
     }
 
@@ -110,6 +116,11 @@ pub struct H264Encoder {
     vaapi: Option<VaapiState>,
     opts: EncoderOpts,
     frame_count: u64,
+    /// AVCC (length-prefixed) SPS+PPS prepended to every keyframe.
+    /// Captured lazily from the encoder's extradata on the first keyframe.
+    /// Enables decoders that missed the catalog's out-of-band description to
+    /// initialize from inline parameter sets in the keyframe itself.
+    sps_pps: Option<Vec<u8>>,
 }
 
 impl H264Encoder {
@@ -147,6 +158,7 @@ impl H264Encoder {
                         backend,
                         opts,
                         frame_count: 0,
+                        sps_pps: None,
                     });
                 }
                 Err(e) => {
@@ -255,13 +267,43 @@ impl H264Encoder {
             let mut packet = ffmpeg::packet::Packet::empty();
             match self.encoder.receive_packet(&mut packet) {
                 Ok(()) => {
-                    let payload = packet.data().unwrap_or(&[]).to_vec();
+                    let is_keyframe = packet.is_key();
+                    let mut payload = packet.data().unwrap_or(&[]).to_vec();
+
+                    // Lazily capture SPS+PPS from extradata on the first keyframe.
+                    if is_keyframe && self.sps_pps.is_none() {
+                        if let Some(ed) = self.encoder.extradata() {
+                            let sps_pps = parse_avcc_to_sps_pps_avcc(ed);
+                            if !sps_pps.is_empty() {
+                                tracing::debug!(
+                                    "H264Encoder: captured SPS+PPS ({} bytes) from extradata",
+                                    sps_pps.len()
+                                );
+                                self.sps_pps = Some(sps_pps);
+                            }
+                        }
+                    }
+
+                    // Prepend cached SPS+PPS to every keyframe so decoders that missed
+                    // the catalog's out-of-band description can initialize from inline sets.
+                    if is_keyframe {
+                        if let Some(ref sps_pps) = self.sps_pps {
+                            if !sps_pps.is_empty() {
+                                let mut combined =
+                                    Vec::with_capacity(sps_pps.len() + payload.len());
+                                combined.extend_from_slice(sps_pps);
+                                combined.extend_from_slice(&payload);
+                                payload = combined;
+                            }
+                        }
+                    }
+
                     let hang_frame = hang::Frame {
                         payload: payload.into(),
                         timestamp: Timestamp::from_micros(
                             self.frame_count * 1_000_000 / self.opts.framerate as u64,
                         )?,
-                        keyframe: packet.is_key(),
+                        keyframe: is_keyframe,
                     };
                     return Ok(Poll::Ready(Some(hang_frame)));
                 }
@@ -454,6 +496,70 @@ impl Drop for VaapiState {
             }
         }
     }
+}
+
+/// Extract SPS and PPS NAL units from FFmpeg's avcC extradata and re-encode them
+/// as a single AVCC (length-prefixed) byte sequence.
+///
+/// FFmpeg's extradata is already in avcC format but we only need the SPS+PPS
+/// portion, stripped of the avcC box header, so decoders can prepend them to
+/// keyframes for self-contained initialization.
+fn parse_avcc_to_sps_pps_avcc(avcc: &[u8]) -> Vec<u8> {
+    if avcc.len() < 8 || avcc[0] > 1 {
+        return vec![];
+    }
+
+    let mut offset = 5;
+    let num_sps = (avcc[offset] & 0x1F) as usize;
+    offset += 1;
+    if num_sps == 0 {
+        return vec![];
+    }
+
+    if offset + 2 > avcc.len() {
+        return vec![];
+    }
+    let sps_len = u16::from_be_bytes([avcc[offset], avcc[offset + 1]]) as usize;
+    offset += 2;
+    if offset + sps_len > avcc.len() {
+        return vec![];
+    }
+    let sps = &avcc[offset..offset + sps_len];
+    offset += sps_len;
+
+    for _ in 1..num_sps {
+        if offset + 2 > avcc.len() {
+            return vec![];
+        }
+        let len = u16::from_be_bytes([avcc[offset], avcc[offset + 1]]) as usize;
+        offset += 2 + len;
+    }
+
+    if offset >= avcc.len() {
+        return vec![];
+    }
+    let num_pps = avcc[offset] as usize;
+    offset += 1;
+    if num_pps == 0 {
+        return vec![];
+    }
+
+    if offset + 2 > avcc.len() {
+        return vec![];
+    }
+    let pps_len = u16::from_be_bytes([avcc[offset], avcc[offset + 1]]) as usize;
+    offset += 2;
+    if offset + pps_len > avcc.len() {
+        return vec![];
+    }
+    let pps = &avcc[offset..offset + pps_len];
+
+    let mut out = Vec::with_capacity(4 + sps.len() + 4 + pps.len());
+    out.extend_from_slice(&(sps.len() as u32).to_be_bytes());
+    out.extend_from_slice(sps);
+    out.extend_from_slice(&(pps.len() as u32).to_be_bytes());
+    out.extend_from_slice(pps);
+    out
 }
 
 // pub struct Av1FfmpegEncoder {

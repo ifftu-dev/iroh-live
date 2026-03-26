@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! Pure Opus decoder using `audiopus` (libopus binding, no ffmpeg).
 
 use anyhow::Result;
-use audiopus::{coder::Decoder, packet::Packet, Channels, SampleRate};
+use audiopus::{Channels, SampleRate, coder::Decoder, packet::Packet};
 use hang::catalog::AudioConfig;
 
 use crate::av::{AudioDecoder, AudioFormat};
@@ -27,18 +26,13 @@ const MAX_FRAME_SAMPLES: usize = 48_000 * 120 / 1000 * 2;
 
 pub struct PureOpusDecoder {
     decoder: Decoder,
-    /// Decode output buffer (f32 samples, interleaved).
     decode_buf: Vec<f32>,
-    /// Number of valid decoded samples in `decode_buf`.
     decoded_len: usize,
-    /// Target channel count for output.
     target_channels: u32,
-    /// Source channel count from the stream.
     source_channels: u32,
-    /// Target sample rate.
     target_sample_rate: u32,
-    /// Source sample rate.
     source_sample_rate: u32,
+    converted_buf: Vec<f32>,
 }
 
 impl AudioDecoder for PureOpusDecoder {
@@ -72,11 +66,6 @@ impl AudioDecoder for PureOpusDecoder {
         let decoder = Decoder::new(sr, channels)
             .map_err(|e| anyhow::anyhow!("Failed to create Opus decoder: {e}"))?;
 
-        // Note: extradata/description is ignored for pure opus decoder.
-        // The ffmpeg decoder uses it to configure codec parameters, but
-        // the libopus decoder doesn't need it — sample rate and channels
-        // are sufficient. The two are bitstream-compatible.
-
         tracing::info!(
             "Pure Opus decoder initialized: {}Hz {} ch -> {}Hz {} ch",
             config.sample_rate,
@@ -93,6 +82,7 @@ impl AudioDecoder for PureOpusDecoder {
             source_channels: config.channel_count,
             target_sample_rate: target_format.sample_rate,
             source_sample_rate: config.sample_rate,
+            converted_buf: Vec::new(),
         })
     }
 
@@ -116,7 +106,6 @@ impl AudioDecoder for PureOpusDecoder {
             .decode_float(Some(opus_packet), output, false)
             .map_err(|e| anyhow::anyhow!("Opus decode failed: {e}"))?;
 
-        // Total interleaved samples
         self.decoded_len = decoded_samples_per_channel * self.source_channels as usize;
 
         tracing::trace!(
@@ -136,10 +125,6 @@ impl AudioDecoder for PureOpusDecoder {
 
         let source_samples = &self.decode_buf[..self.decoded_len];
 
-        // If source and target formats match, return directly.
-        // For now we do simple channel conversion in-place if needed.
-        // Full resampling (rate conversion) is deferred — in practice both
-        // sides use 48kHz so this path is rarely hit.
         if self.source_channels == self.target_channels
             && self.source_sample_rate == self.target_sample_rate
         {
@@ -147,17 +132,33 @@ impl AudioDecoder for PureOpusDecoder {
             return Ok(Some(source_samples));
         }
 
-        // Channel conversion: mono -> stereo or stereo -> mono
-        // We reuse decode_buf by writing the converted samples into the
-        // upper half, then returning a slice of that.
-        // Actually, since we need to return &[f32] referencing our own buffer,
-        // and we can't have two mutable references, we'll do the conversion
-        // in a separate buffer. But to avoid allocation, we can handle the
-        // common case where source == target (already handled above) and
-        // for the uncommon case, just return the source samples and let the
-        // audio output handle the mismatch. The firewheel cpal backend
-        // already does resampling when `cpal_resample_inputs` is enabled.
-        self.decoded_len = 0;
-        Ok(Some(source_samples))
+        match (self.source_channels, self.target_channels) {
+            (2, 1) => {
+                let mono_samples = source_samples.len() / 2;
+                self.converted_buf.clear();
+                self.converted_buf.reserve(mono_samples);
+                for i in 0..mono_samples {
+                    let left = source_samples[i * 2];
+                    let right = source_samples[i * 2 + 1];
+                    self.converted_buf.push((left + right) * 0.5);
+                }
+                self.decoded_len = 0;
+                Ok(Some(&self.converted_buf))
+            }
+            (1, 2) => {
+                self.converted_buf.clear();
+                self.converted_buf.reserve(source_samples.len() * 2);
+                for &sample in source_samples {
+                    self.converted_buf.push(sample);
+                    self.converted_buf.push(sample);
+                }
+                self.decoded_len = 0;
+                Ok(Some(&self.converted_buf))
+            }
+            _ => {
+                self.decoded_len = 0;
+                Ok(Some(source_samples))
+            }
+        }
     }
 }
