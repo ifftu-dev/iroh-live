@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use std::sync::{Arc, Mutex};
 
 use moq_lite::BroadcastProducer;
+#[cfg(not(feature = "video"))]
+use moq_media::opus::PureOpusEncoder;
 use moq_media::{
     audio::AudioBackend,
     av::AudioPreset,
@@ -28,8 +29,6 @@ use moq_media::{
     ffmpeg::{H264Encoder, OpusEncoder},
     publish::VideoRenditions,
 };
-#[cfg(not(feature = "video"))]
-use moq_media::opus::PureOpusEncoder;
 use n0_error::{AnyError, Result};
 use tracing::{info, warn};
 
@@ -145,7 +144,9 @@ impl RoomPublisherSync {
 
     #[cfg(not(feature = "video"))]
     pub fn set_camera(&mut self, _enable: bool) -> Result<()> {
-        Err(n0_error::anyerr!("Camera is not available without the video feature"))
+        Err(n0_error::anyerr!(
+            "Camera is not available without the video feature"
+        ))
     }
 
     pub fn screen(&self) -> bool {
@@ -197,7 +198,9 @@ impl RoomPublisherSync {
 
     #[cfg(not(feature = "video"))]
     pub fn set_screen(&mut self, _enable: bool) -> Result<()> {
-        Err(n0_error::anyerr!("Screen sharing is not available without the video feature"))
+        Err(n0_error::anyerr!(
+            "Screen sharing is not available without the video feature"
+        ))
     }
 
     pub fn audio(&self) -> bool {
@@ -221,7 +224,8 @@ impl RoomPublisherSync {
                     #[cfg(feature = "video")]
                     let renditions = AudioRenditions::new::<OpusEncoder>(mic, [AudioPreset::Hq]);
                     #[cfg(not(feature = "video"))]
-                    let renditions = AudioRenditions::new::<PureOpusEncoder>(mic, [AudioPreset::Hq]);
+                    let renditions =
+                        AudioRenditions::new::<PureOpusEncoder>(mic, [AudioPreset::Hq]);
                     if let Err(err) = camera.lock().unwrap().set_audio(Some(renditions)) {
                         warn!("failed to set audio: {err:#}");
                     }

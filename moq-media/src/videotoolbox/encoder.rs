@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! VideoToolbox H.264 encoder for iOS.
 //!
 //! Uses `VTCompressionSession` to encode BGRA `VideoFrame`s into H.264
@@ -35,7 +34,7 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use buf_list::BufList;
 use bytes::Bytes;
 use hang::Timestamp;

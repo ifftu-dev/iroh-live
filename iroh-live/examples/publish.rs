@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use clap::Parser;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_live::{

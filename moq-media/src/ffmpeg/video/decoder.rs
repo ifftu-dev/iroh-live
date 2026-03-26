@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use anyhow::{Context, Result};
 use ffmpeg_next::{
     self as ffmpeg, codec, codec::Id as CodecId, util::frame::video::Video as FfmpegFrame,

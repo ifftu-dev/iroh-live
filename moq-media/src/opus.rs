@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! Pure Opus encoder/decoder using `audiopus` (libopus binding).
 //!
 //! This module provides Opus encoding/decoding without depending on ffmpeg.
