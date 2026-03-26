@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! Pure Opus encoder using `audiopus` (libopus binding, no ffmpeg).
 
 use anyhow::Result;
-use audiopus::{coder::Encoder, Application, Channels, SampleRate};
-use hang::{catalog::AudioConfig, Timestamp};
+use audiopus::{Application, Channels, SampleRate, coder::Encoder};
+use hang::{Timestamp, catalog::AudioConfig};
 use tracing::trace;
 
 use crate::av::{AudioEncoder, AudioEncoderInner, AudioFormat, AudioPreset};

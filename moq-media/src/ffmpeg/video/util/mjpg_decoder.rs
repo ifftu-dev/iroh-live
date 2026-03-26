@@ -12,17 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use std::time::Instant;
 
 use ffmpeg_next::{
-    self as ffmpeg, codec::Id, format::Pixel, frame::Video as FfmpegVideoFrame, Error, Packet,
+    self as ffmpeg, Error, Packet, codec::Id, format::Pixel, frame::Video as FfmpegVideoFrame,
 };
 use tracing::trace;
 
 use crate::{
     av::VideoFrame,
-    ffmpeg::util::{ffmpeg_frame_to_video_frame, Rescaler},
+    ffmpeg::util::{Rescaler, ffmpeg_frame_to_video_frame},
 };
 
 pub struct MjpgDecoder {

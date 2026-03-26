@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 // This entire module is gated by the `aec` feature in the parent module (audio.rs).
 // It requires the `webrtc-audio-processing` crate which doesn't cross-compile to iOS.
 
@@ -25,8 +24,8 @@ mod processor {
     use std::{
         num::NonZeroU32,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
         },
     };
 
@@ -174,6 +173,7 @@ mod firewheel_nodes {
     use std::collections::VecDeque;
 
     use firewheel::{
+        StreamInfo,
         channel_config::{ChannelConfig, ChannelCount},
         diff::{Diff, Patch},
         event::ProcEvents,
@@ -181,7 +181,6 @@ mod firewheel_nodes {
             AudioNode, AudioNodeInfo, AudioNodeProcessor, ConstructProcessorContext, ProcBuffers,
             ProcExtra, ProcInfo, ProcStreamCtx, ProcessStatus,
         },
-        StreamInfo,
     };
     use webrtc_audio_processing::NUM_SAMPLES_PER_FRAME;
 

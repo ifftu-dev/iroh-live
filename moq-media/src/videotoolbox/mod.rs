@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 //! iOS-only video encoder/decoder/capture using Apple VideoToolbox + AVFoundation.
 //!
 //! This module is gated behind `feature = "video-ios"` and provides:

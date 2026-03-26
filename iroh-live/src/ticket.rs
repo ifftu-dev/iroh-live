@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 use iroh::EndpointAddr;
 use n0_error::{Result, StdResultExt};
 use serde::{Deserialize, Serialize};
