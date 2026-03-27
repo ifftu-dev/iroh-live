@@ -14,7 +14,7 @@
 
 use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 pub use nokhwa::utils::CameraIndex;
 use nokhwa::{
     nokhwa_initialize,
@@ -22,6 +22,7 @@ use nokhwa::{
     utils::{CameraFormat, FrameFormat, RequestedFormat, RequestedFormatType, Resolution},
 };
 use tracing::{debug, info, trace, warn};
+#[cfg(not(target_os = "linux"))]
 use xcap::{Monitor, VideoRecorder};
 
 use crate::{
@@ -29,6 +30,7 @@ use crate::{
     ffmpeg::util::MjpgDecoder,
 };
 
+#[cfg(not(target_os = "linux"))]
 pub struct ScreenCapturer {
     pub(crate) _monitor: Monitor,
     pub(crate) width: u32,
@@ -37,15 +39,21 @@ pub struct ScreenCapturer {
     pub(crate) rx: std::sync::mpsc::Receiver<xcap::Frame>,
 }
 
+#[cfg(target_os = "linux")]
+pub struct ScreenCapturer;
+
 // TODO: Review if sound.
+#[cfg(not(target_os = "linux"))]
 unsafe impl Send for ScreenCapturer {}
 
+#[cfg(not(target_os = "linux"))]
 impl Drop for ScreenCapturer {
     fn drop(&mut self) {
         self.video_recorder.stop().ok();
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 impl ScreenCapturer {
     pub fn new() -> Result<Self> {
         info!("Initializing screen capturer (xcap)");
@@ -77,6 +85,16 @@ impl ScreenCapturer {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl ScreenCapturer {
+    pub fn new() -> Result<Self> {
+        Err(anyhow!(
+            "screen capture is unavailable on Linux in this build"
+        ))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 impl VideoSource for ScreenCapturer {
     fn name(&self) -> &str {
         "screen"
@@ -120,6 +138,36 @@ impl VideoSource for ScreenCapturer {
             },
             raw: raw_frame.raw.into(),
         }))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl VideoSource for ScreenCapturer {
+    fn name(&self) -> &str {
+        "screen"
+    }
+
+    fn format(&self) -> VideoFormat {
+        VideoFormat {
+            pixel_format: PixelFormat::Rgba,
+            dimensions: [0, 0],
+        }
+    }
+
+    fn start(&mut self) -> Result<()> {
+        Err(anyhow!(
+            "screen capture is unavailable on Linux in this build"
+        ))
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn pop_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
+        Err(anyhow!(
+            "screen capture is unavailable on Linux in this build"
+        ))
     }
 }
 

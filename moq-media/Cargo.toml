@@ -35,7 +35,6 @@ strum = { version = "0.27", features = ["derive"] }
 tokio = { version = "1.48.0", features = ["sync"] }
 tokio-util = "0.7.17"
 tracing = "0.1.41"
-xcap = { version = "0.8", optional = true }
 webrtc-audio-processing = { version = "0.5.0", features = ["bundled"], optional = true }
 bytes = "1.11.0"
 buf-list = "1.1.2"
@@ -54,8 +53,10 @@ default = ["video", "aec"]
 # Acoustic Echo Cancellation (requires webrtc-audio-processing which doesn't cross-compile to iOS)
 aec = ["dep:webrtc-audio-processing"]
 
-# Full video + audio support (requires ffmpeg, nokhwa, xcap)
-video = ["dep:ffmpeg-next", "dep:nokhwa", "dep:xcap", "dep:image"]
+# Full video + audio support (ffmpeg + camera capture).
+# Screen capture uses xcap on non-Linux targets only because the current Linux
+# PipeWire/libspa combination on GitHub runners is not build-stable.
+video = ["dep:ffmpeg-next", "dep:nokhwa", "dep:image"]
 
 # iOS-only video support (VideoToolbox H264 encoder/decoder, no ffmpeg/nokhwa/xcap).
 # Activates the shared video types/traits in av.rs and the `videotoolbox` module.
@@ -78,6 +79,9 @@ ffmpeg-sys-next = { version = "8.0.1", optional = true, features = [
   "build-videotoolbox",
   "build-audiotoolbox",
 ] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+xcap = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ffmpeg-sys-next = { version = "8.0.1", optional = true, features = [
