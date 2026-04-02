@@ -14,7 +14,7 @@
 
 use std::str::FromStr;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 pub use nokhwa::utils::CameraIndex;
 use nokhwa::{
     nokhwa_initialize,
@@ -22,7 +22,7 @@ use nokhwa::{
     utils::{CameraFormat, FrameFormat, RequestedFormat, RequestedFormatType, Resolution},
 };
 use tracing::{debug, info, trace, warn};
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "android"))]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use xcap::{Monitor, VideoRecorder};
 
 use crate::{
@@ -30,7 +30,7 @@ use crate::{
     ffmpeg::util::MjpgDecoder,
 };
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "android"))]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub struct ScreenCapturer {
     pub(crate) _monitor: Monitor,
     pub(crate) width: u32,
@@ -39,21 +39,21 @@ pub struct ScreenCapturer {
     pub(crate) rx: std::sync::mpsc::Receiver<xcap::Frame>,
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "android")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub struct ScreenCapturer;
 
 // TODO: Review if sound.
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "android"))]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 unsafe impl Send for ScreenCapturer {}
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "android"))]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl Drop for ScreenCapturer {
     fn drop(&mut self) {
         self.video_recorder.stop().ok();
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "android"))]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl ScreenCapturer {
     pub fn new() -> Result<Self> {
         info!("Initializing screen capturer (xcap)");
@@ -85,16 +85,14 @@ impl ScreenCapturer {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "android")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl ScreenCapturer {
     pub fn new() -> Result<Self> {
-        Err(anyhow!(
-            "screen capture is unavailable on Linux in this build"
-        ))
+        Err(anyhow!("screen capture is unavailable on this platform"))
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "android"))]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl VideoSource for ScreenCapturer {
     fn name(&self) -> &str {
         "screen"
@@ -141,7 +139,7 @@ impl VideoSource for ScreenCapturer {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "android")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl VideoSource for ScreenCapturer {
     fn name(&self) -> &str {
         "screen"
@@ -155,9 +153,7 @@ impl VideoSource for ScreenCapturer {
     }
 
     fn start(&mut self) -> Result<()> {
-        Err(anyhow!(
-            "screen capture is unavailable on Linux in this build"
-        ))
+        Err(anyhow!("screen capture is unavailable on this platform"))
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -165,9 +161,7 @@ impl VideoSource for ScreenCapturer {
     }
 
     fn pop_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
-        Err(anyhow!(
-            "screen capture is unavailable on Linux in this build"
-        ))
+        Err(anyhow!("screen capture is unavailable on this platform"))
     }
 }
 
