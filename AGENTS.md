@@ -2,6 +2,10 @@
 
 **Generated:** 2026-03-20
 
+## Standing Instructions
+
+- **Documentation review after code changes**: After completing any code changes, always assess whether README and other docs need updating. Ask the user for permission before modifying any documentation files.
+
 ## Overview
 
 Patched iroh-live streaming libs. Workspace containing 3 crates that are pulled into `alexandria/` via `[patch]` in workspace `Cargo.toml`.

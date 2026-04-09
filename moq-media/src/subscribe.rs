@@ -21,7 +21,7 @@ use hang::{
 use moq_lite::{BroadcastConsumer, Track};
 use n0_error::{Result, StackResultExt, StdResultExt};
 use n0_future::task::AbortOnDropHandle;
-use n0_watcher::{Watchable, Watcher};
+use n0_watcher::Watchable;
 use tokio::{
     sync::mpsc::{self, error::TryRecvError},
     time::Instant,

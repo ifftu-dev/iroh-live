@@ -335,6 +335,7 @@ struct AudioDriver {
 }
 
 impl AudioDriver {
+    #[allow(dead_code)]
     fn new(rx: mpsc::Receiver<DriverMessage>) -> Self {
         Self::new_with_devices(rx, None, None)
     }

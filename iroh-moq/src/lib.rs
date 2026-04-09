@@ -113,7 +113,12 @@ impl Moq {
 
     pub async fn published_broadcasts(&self) -> Vec<String> {
         let (reply, reply_rx) = oneshot::channel();
-        if let Err(_) = self.tx.send(ActorMessage::GetPublished { reply }).await {
+        if self
+            .tx
+            .send(ActorMessage::GetPublished { reply })
+            .await
+            .is_err()
+        {
             return vec![];
         }
         reply_rx.await.unwrap_or_default()
@@ -291,6 +296,7 @@ impl MoqSession {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ActorMessage {
     HandleSession {
         session: MoqSession,
@@ -311,6 +317,7 @@ enum ActorMessage {
 type BroadcastName = String;
 
 #[derive()]
+#[allow(clippy::type_complexity)]
 struct Actor {
     endpoint: Endpoint,
     shutdown_token: CancellationToken,
@@ -405,12 +412,13 @@ impl Actor {
         self.session_tasks.spawn(async move {
             let res = tokio::select! {
                 _ = shutdown.cancelled() => {
+                    #[allow(clippy::useless_conversion)]
                     session.close(0u32.into(), b"cancelled");
                     Ok(())
                 }
                 result = session.closed() => match result {
                     SessionError::ConnectionError(ConnectionError::LocallyClosed) => Ok(()),
-                    err @ _ => Err(err)
+                    err => Err(err)
                 },
             };
             (remote, res)
