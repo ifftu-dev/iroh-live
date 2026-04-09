@@ -21,7 +21,8 @@ use hang::{
 use moq_lite::{BroadcastConsumer, Track};
 use n0_error::{Result, StackResultExt, StdResultExt};
 use n0_future::task::AbortOnDropHandle;
-use n0_watcher::Watchable;
+#[allow(unused_imports)] // Watcher trait required for .update() and .peek() on Direct<T>
+use n0_watcher::{Watchable, Watcher};
 use tokio::{
     sync::mpsc::{self, error::TryRecvError},
     time::Instant,
