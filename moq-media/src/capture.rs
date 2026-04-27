@@ -88,7 +88,9 @@ impl ScreenCapturer {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl ScreenCapturer {
     pub fn new() -> Result<Self> {
-        Err(anyhow::anyhow!("screen capture is unavailable on this platform"))
+        Err(anyhow::anyhow!(
+            "screen capture is unavailable on this platform"
+        ))
     }
 }
 
@@ -153,7 +155,9 @@ impl VideoSource for ScreenCapturer {
     }
 
     fn start(&mut self) -> Result<()> {
-        Err(anyhow::anyhow!("screen capture is unavailable on this platform"))
+        Err(anyhow::anyhow!(
+            "screen capture is unavailable on this platform"
+        ))
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -161,7 +165,9 @@ impl VideoSource for ScreenCapturer {
     }
 
     fn pop_frame(&mut self) -> anyhow::Result<Option<VideoFrame>> {
-        Err(anyhow::anyhow!("screen capture is unavailable on this platform"))
+        Err(anyhow::anyhow!(
+            "screen capture is unavailable on this platform"
+        ))
     }
 }
 
